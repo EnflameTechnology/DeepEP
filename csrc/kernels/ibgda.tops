@@ -1,0 +1,600 @@
+/*************************************************************************
+ * Copyright (c) 2025, ENFLAME CORPORATION. All rights reserved.
+ *
+ * See LICENSE.txt for license information
+ ************************************************************************/
+#include <vector>
+#include <cstring>
+
+#include "configs.h"
+#include "exception.h"
+#include "launch.h"
+#include "ep.h"
+#include "api.h"
+
+#include "param.h"
+
+#ifndef IF_NAMESIZE
+#define IF_NAMESIZE (16)
+#endif
+
+#include "ibgda_device.h"
+
+#define ibgdaINFO ibgdaTRACE
+
+#define unified_endpoint_print(_nRanks, _nQps, _ueps_ptr)                                  \
+  unified_endpoint *ueps = reinterpret_cast<unified_endpoint*>((uintptr_t)(_ueps_ptr));    \
+  for (int r = 0; r < nRanks; r++) {                                                       \
+    for (int qp = 0; qp < _nQps; ++qp) {                                                   \
+    RdmaEndpoint *dbgEP = reinterpret_cast<RdmaEndpoint*>(&(ueps[r * _nQps + qp]));        \
+    ibgdaINFO("r%-2d qp[%-2d] %p %d psn: %d qpn: %4d ib [%d]  "                            \
+           "eth [gid: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x, "  \
+           "mac:  %02x%02x%02x%02x%02x%02x]\n",                                            \
+           r, qp, dbgEP, dbgEP->GetProviderType(),                                         \
+           dbgEP->handle.psn,                                                              \
+           dbgEP->handle.qpn,                                                              \
+           dbgEP->handle.ib.lid,                                                           \
+           dbgEP->handle.eth.gid[ 0 ],                                                     \
+           dbgEP->handle.eth.gid[ 1 ],                                                     \
+           dbgEP->handle.eth.gid[ 2 ],                                                     \
+           dbgEP->handle.eth.gid[ 3 ],                                                     \
+           dbgEP->handle.eth.gid[ 4 ],                                                     \
+           dbgEP->handle.eth.gid[ 5 ],                                                     \
+           dbgEP->handle.eth.gid[ 6 ],                                                     \
+           dbgEP->handle.eth.gid[ 7 ],                                                     \
+           dbgEP->handle.eth.gid[ 8 ],                                                     \
+           dbgEP->handle.eth.gid[ 9 ],                                                     \
+           dbgEP->handle.eth.gid[10 ],                                                     \
+           dbgEP->handle.eth.gid[11 ],                                                     \
+           dbgEP->handle.eth.gid[12 ],                                                     \
+           dbgEP->handle.eth.gid[13 ],                                                     \
+           dbgEP->handle.eth.gid[14 ],                                                     \
+           dbgEP->handle.eth.gid[15 ],                                                     \
+           dbgEP->handle.eth.mac[0],                                                       \
+           dbgEP->handle.eth.mac[1],                                                       \
+           dbgEP->handle.eth.mac[2],                                                       \
+           dbgEP->handle.eth.mac[3],                                                       \
+           dbgEP->handle.eth.mac[4],                                                       \
+           dbgEP->handle.eth.mac[5]);                                                      \
+    (void)dbgEP;                                                                           \
+    }                                                                                      \
+  }
+
+
+namespace deep_ep {
+
+#ifdef ENABLE_MORI_GCU
+
+int selectGdrNetDevice(epComm_t comm, int rank, char *devName) {
+    return epNetGetGdrDevice(comm, rank, devName);
+}
+
+namespace ibgda_gcu_test {
+
+#define IBGDA_TEST_THREAD_NUM     (32) // Total THREADs to run ibgda_gcu_testing
+#define IBGDA_TEST_SUB_THREAD_NUM (4)  // SUB-THREADs num to launch for ibgda_gcu_testing
+#define IBGDA_TEST_QP_NUM         (4)  // QP NUM to ibgda_gcu_testing data
+
+__global__ void verifyIbgdaWriteKernel(const uint64_t *buffer, int rank, int nRanks, const uint64_t timeout) {
+  uint64_t retry = 0;
+  bool bVerified = true;
+  int thdId  = threadIdx.x;
+  int blkNum = gridDim.x;
+  int thdNum = blockDim.x;
+  int subNum = threadDim.x;
+
+  int globalThdId  = subNum * (thdNum * blockIdx.x + thdId) + subThreadIdx.x;
+  int globalThdNum = blkNum * thdNum * subNum;
+
+  if (globalThdId >= nRanks) return;
+
+  // ibgdaINFO("Kernel Info DIM:grids[%d] blocks[%d] threads[%d], "
+  //        "Idx:block[%d] thread[%d] subthread[%d], "
+  //        "globalThdId %d globalThdNum %d\n",
+  //        gridDim.x, blockDim.x, threadDim.x,
+  //        blockIdx.x, threadIdx.x, subThreadIdx.x,
+  //        globalThdId, globalThdNum);
+
+  for (retry = 0; retry < timeout; retry ++) {
+    bVerified = true;
+    for(int r = globalThdId; r < nRanks; r += globalThdNum) {
+      if (static_cast<uint64_t>(r) != buffer[r]) bVerified = false;
+    }
+    if (bVerified) break;
+  }
+
+  if (false == bVerified) {
+    printf("verify IBGDA Write%s retry %ld timeout %ld for r[%d] n[%d]\n",
+           (bVerified)?" Success!!":" Failed", retry, timeout, rank, nRanks);
+  }
+  if (0 == globalThdId) {
+    printf("verify IBGDA Write data[%d]: %ld nRanks[%d]\n", rank, buffer[rank], nRanks);
+  }
+}
+
+void ibgdaWriteVerify(uint64_t *buffer, int rank, int nRanks) {
+  uint64_t timeout = 55555;
+  size_t gridDim = 1;
+  size_t blockDim = 6;
+  size_t sharedMemBytes = 0;
+  topsStream_t streamPtr = nullptr;
+  ibgda_gcu_test::verifyIbgdaWriteKernel<<<gridDim, blockDim, sharedMemBytes, streamPtr>>>
+    (buffer, rank, nRanks, timeout);
+  TOPS_CHECK(topsDeviceSynchronize());
+  for (int t = 0, idx = 0; t < IBGDA_TEST_THREAD_NUM; t ++) {
+    for (int r = 0; r < nRanks; r ++) {
+      printf("%-4ld", buffer[idx ++]);
+    }
+    printf("|%d\n", idx / nRanks);
+  }
+}
+
+template <ProviderType P>
+ __global__ void testIbgdaWrite(unified_endpoint *endpoints, RdmaMemoryRegion *mrs, int rank, int nRanks, int num_qp) {
+  int thdId  = threadIdx.x;
+  int blkNum = gridDim.x;
+  int thdNum = blockDim.x;
+  int subNum = threadDim.x;
+
+  int glbThdId  = subNum * (thdNum * blockIdx.x + thdId) + subThreadIdx.x;
+  int glbThdNum = blkNum * thdNum * subNum;
+  int qp_id     = glbThdId % (std::min(IBGDA_TEST_QP_NUM, num_qp));
+
+  ibgdaINFO("Kernel DIM Info:grids[%d] blocks[%d] threads[%d], "
+            "Idx:block[%d] thread[%d] subthread[%d], "
+            "glbThdId %3d glbThdNum %d, rank %d nRanks %d num_qp %d qp[%d]\n",
+            gridDim.x, blockDim.x, threadDim.x,
+            blockIdx.x, threadIdx.x, subThreadIdx.x,
+            glbThdId, glbThdNum,
+            rank, nRanks, num_qp, qp_id);
+
+  if (IBGDA_TEST_THREAD_NUM <= glbThdId) return;
+
+  RdmaMemoryRegion *mrSend = mrs + rank;
+  RdmaMemoryRegion *mrRecv;
+  // size_t msgSize = sizeof(uint64_t) * nRanks;
+
+  RdmaEndpoint *endpoint, *epSend, *epRecv;
+
+  RdmaMemoryRegion *mrhandles = mrs;
+  int num_ranks = nRanks;
+  for (int r = 0; r < num_ranks; r++) {
+    ibgdaINFO("global r[%d] MR: addr 0x%lX lkey 0x%x rkey 0x%x length %ld\n", r,
+           mrhandles[r].addr,
+           mrhandles[r].lkey,
+           mrhandles[r].rkey,
+           mrhandles[r].length);
+  }
+  (void)mrhandles, (void)glbThdNum;
+  size_t offset = sizeof(uint64_t) * (rank + glbThdId * nRanks);
+  // size_t dataSz = sizeof(uint64_t);
+  uint64_t *src = reinterpret_cast<uint64_t*>(mrSend->addr + offset);
+  for (int r = 0; r < nRanks; r ++) {
+    if (r == rank) continue;
+    mrRecv = mrs + r;
+    // using remote rank of r, as local index of endpoints
+    epSend = epRecv = endpoint = reinterpret_cast<RdmaEndpoint*>(endpoints + r * num_qp + qp_id);
+    ibgdaINFO("Send data from r[%d] to r[%d] via qp[%d]\n", rank, r, qp_id);
+
+    //deep_ep_ibgda::morWrite<P>(*epSend, *mrSend, *mrRecv, offset, offset, dataSz);
+    uint64_t *dst = reinterpret_cast<uint64_t*>(mrRecv->addr + offset);
+    deep_ep_ibgda::ibgdaSendFlag<P, uint64_t>(*epSend, *mrSend, *mrRecv, src, dst);
+  }
+  ibgdaINFO("Send Done from r[%d] to others via qp[%d] %ld@%p\n", rank, qp_id, *src, src);
+}
+
+} // namespace ibgda_gcu_test
+
+#endif
+
+namespace ibgda_gcu {
+
+#ifdef ENABLE_MORI_GCU
+struct ibgdaCookieInfo {
+  // setup Parameters
+  epComm_t comm;
+  int rank;
+  int nRanks;
+  void *rmda_buffer_ptr;
+  size_t num_rdma_bytes;
+  uintptr_t ibgda_info_ptr;
+
+  // local ibgda Setup Infos
+  char gdrDevName[IF_NAMESIZE + 1];
+  RdmaContext *rdma_context;
+  RdmaDevice *device;
+  RdmaDeviceContext *device_context;
+  RdmaEndpoint endpoints[EP_MAX_RANKS * MAX_IBGDA_QP_NUMS];
+  RdmaMemoryRegion mr_handle;
+
+  // self Cookie for safety
+  void *selfCookie;
+};
+#endif
+
+int ibgdaFree(epComm_t comm, void **ppCookie) {
+  int ret = epSuccess;
+
+#ifdef ENABLE_MORI_GCU
+  if (nullptr == ppCookie || nullptr == *ppCookie) return ret;
+
+  ibgdaCookieInfo *ibgdaCookie = reinterpret_cast<ibgdaCookieInfo*>(*ppCookie);
+
+  EP_HOST_ASSERT(ibgdaCookie->selfCookie == ibgdaCookie);
+  EP_HOST_ASSERT(ibgdaCookie->mr_handle.addr == (uintptr_t)ibgdaCookie->rmda_buffer_ptr);
+
+  ibgdaCookie->device_context->DeregisterRdmaMemoryRegion(ibgdaCookie->rmda_buffer_ptr);
+  delete ibgdaCookie->rdma_context;
+  free(*ppCookie);
+  *ppCookie = nullptr;
+#endif
+
+  (void)comm;
+  (void)ppCookie;
+
+  return ret;
+}
+
+#ifdef ENABLE_MORI_GCU
+EP_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
+//static int ibgdaGetGidIndex(struct ibv_context *context, int port_num, const struct ibv_port_attr* port_attr, int *gid_idx) {
+//
+//  extern epResult_t epIbGetGidIndex(struct ibv_context *, uint8_t, struct ibv_port_attr*, int *);
+//
+//  struct ibv_port_attr portAttr = *port_attr;
+//
+//  return epIbGetGidIndex(context, port_num, &portAttr, gid_idx);
+//}
+#endif
+
+int ibgdaSetup(epComm_t comm, int rank, int nRanks, void *rmda_buffer_ptr, size_t num_rdma_bytes, uintptr_t ibgda_info_ptr, void **ppCookie) {
+
+  int ret = epSuccess;
+
+#ifdef ENABLE_MORI_GCU
+
+  // Following to build connection of RdmaEndpoint and RdmaMemoryRegion for all ranks of all peerNode
+  // RDMA initialization
+
+  const int num_qps = IBGDA_NUM_QPS;
+  const int num_msg = IBGDA_WQE_NUM;
+  const int alignmt = IBGDA_ALIGNMENT;
+  const int use_gcu = IBGDA_ON_GCU;
+  const int num_cqe = IBGDA_CQE_NUM;
+
+  static_assert(MAX_IBGDA_QP_NUMS > 0 && 0 == (MAX_IBGDA_QP_NUMS & (MAX_IBGDA_QP_NUMS - 1)), "MAX_IBGDA_QP_NUMS MUST Power of Two !!");
+  static_assert(MAX_IBGDA_QP_NUMS == num_qps, "num_qps oversize of MAX_IBGDA_QP_NUMS");
+  static_assert(sizeof(unified_endpoint) == MAX_IBGDA_EP_SIZE_ALIGNED, "unified_endpoint size must be MAX_IBGDA_EP_SIZE_ALIGNED bytes");
+  static_assert(offsetof(struct unified_endpoint, esl_endpoint) == MAX_IBGDA_EP_SIZE, "unified_endpoint, ibgda_storage mismatched with MAX_IBGDA_EP_SIZE");
+
+  EP_HOST_ASSERT(nRanks > rank);
+  EP_HOST_ASSERT(nullptr != rmda_buffer_ptr);
+  EP_HOST_ASSERT(0 < num_rdma_bytes);
+  EP_HOST_ASSERT(0 < num_qps);
+  EP_HOST_ASSERT(nullptr != ppCookie);
+
+  // 1 Create device
+  RdmaContext * rdma_context = new RdmaContext(RdmaBackendType::DirectVerbs);
+  RdmaDeviceList rdma_devices = rdma_context->GetRdmaDeviceList();
+  NEQCHECK((0 >= rdma_devices.size()), false);
+
+  // generate gdr_devices w/ gdrDevName, select one if no net Dev found
+  char gdrDevName[IF_NAMESIZE + 1];
+  RdmaDeviceList gdr_devices  = {};
+  if (0 > selectGdrNetDevice(comm, rank, gdrDevName))
+    rdma_devices[rank % rdma_devices.size()]->Name().copy(gdrDevName, IF_NAMESIZE);
+  ibgdaINFO("r[%d] found GDR device %s from [%zu] devices\n", rank, gdrDevName, rdma_devices.size());
+  for (auto &device : rdma_devices)
+    if (device->Name() == gdrDevName)
+      gdr_devices.push_back(device);
+
+  NEQCHECK((0 >= gdr_devices.size()), false);
+
+  // Front element of ActiveDevicePortList; RdmaDevice first, portId second;
+  ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(gdr_devices);
+  ActiveDevicePort devPort = activeDevicePortList.front();
+  RdmaDevice *device = devPort.first;
+  NEQCHECK((nullptr == device), false);
+  ibgdaINFO("r[%d] of nRanks [%d] select device %s\n", rank, nRanks, device->Name().c_str());
+
+  RdmaDeviceContext *device_context = device->CreateRdmaDeviceContext();
+  NEQCHECK((nullptr == device_context), false);
+
+  // 2 Create an endpoint
+  int gid_idx = epParamIbGidIndex();
+  if (gid_idx < 0) gid_idx = IBGDA_GID_IDX;
+  //ibgdaGetGidIndex(device_context->GetIbvContext(), devPort.second, device->GetPortAttr(devPort.second), &gid_idx);
+  RdmaEndpointConfig config;
+  config.portId     = devPort.second;
+  config.gidIdx     = gid_idx;
+  config.maxMsgsNum = num_msg;
+  config.alignment  = alignmt;
+  config.onGpu      = use_gcu;
+  config.maxCqeNum  = num_cqe;
+
+  // local RdmaEndpoint: [nRanks][qps]
+  std::vector<unified_endpoint> endpoints(nRanks * num_qps);
+  // global_rdma_ep_handles: [localRank:nRanks][remoteRank:nRanks][qps]
+  std::vector<RdmaEndpointHandle> global_rdma_ep_handles(nRanks * nRanks * num_qps);
+  for (int r = 0; r < nRanks; r++) {
+    if (r == rank) continue;
+    for (int qp = 0; qp < num_qps; ++qp) {
+      RdmaEndpoint *rdmaEndPoint = reinterpret_cast<RdmaEndpoint*>(&endpoints[r * num_qps + qp]);
+
+      *rdmaEndPoint = device_context->CreateRdmaEndpoint(config);
+      endpoints[r * num_qps + qp].padding[0] = 0xAA;
+      endpoints[r * num_qps + qp].padding[1] = 0x55;
+      // index for global_rdma_ep_handles[rank][r][qp];
+      int lclIdx = rank * nRanks * num_qps + r * num_qps + qp;
+      global_rdma_ep_handles[lclIdx] = rdmaEndPoint->handle;
+      ibgdaINFO("local r[%d] endpoints[%d] psn: %d qpn: %6d ib [%d] "
+                "eth [gid: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x, "
+                "mac: %02x%02x%02x%02x%02x%02x]\n",
+                rank,
+                r * num_qps + qp,
+                rdmaEndPoint->handle.psn,
+                rdmaEndPoint->handle.qpn,
+                rdmaEndPoint->handle.ib.lid,
+                rdmaEndPoint->handle.eth.gid[ 0],
+                rdmaEndPoint->handle.eth.gid[ 1],
+                rdmaEndPoint->handle.eth.gid[ 2],
+                rdmaEndPoint->handle.eth.gid[ 3],
+                rdmaEndPoint->handle.eth.gid[ 4],
+                rdmaEndPoint->handle.eth.gid[ 5],
+                rdmaEndPoint->handle.eth.gid[ 6],
+                rdmaEndPoint->handle.eth.gid[ 7],
+                rdmaEndPoint->handle.eth.gid[ 8],
+                rdmaEndPoint->handle.eth.gid[ 9],
+                rdmaEndPoint->handle.eth.gid[10],
+                rdmaEndPoint->handle.eth.gid[11],
+                rdmaEndPoint->handle.eth.gid[12],
+                rdmaEndPoint->handle.eth.gid[13],
+                rdmaEndPoint->handle.eth.gid[14],
+                rdmaEndPoint->handle.eth.gid[15],
+                rdmaEndPoint->handle.eth.mac[0],
+                rdmaEndPoint->handle.eth.mac[1],
+                rdmaEndPoint->handle.eth.mac[2],
+                rdmaEndPoint->handle.eth.mac[3],
+                rdmaEndPoint->handle.eth.mac[4],
+                rdmaEndPoint->handle.eth.mac[5]);
+    }
+  }
+
+  // 3 Allgather global endpoint and connect
+  deep_ep::allGather(comm, global_rdma_ep_handles.data(), sizeof(RdmaEndpointHandle) * nRanks * num_qps);
+
+  for (int r = 0; r < nRanks; r++) {
+    if (r == rank) continue;
+    for (int qp = 0; qp < num_qps; ++qp) {
+      int lclIdx = rank * nRanks * num_qps + r * num_qps + qp;
+      int rmtIdx = r * nRanks * num_qps + rank * num_qps + qp;
+      device_context->ConnectEndpoint(global_rdma_ep_handles[lclIdx],
+                                      global_rdma_ep_handles[rmtIdx],
+                                      IBGDA_QP2ID(r, qp));
+      ibgdaINFO("local "
+                "r[%d] handle [%d] psn %d qpn %6d ib [%d] "
+                "eth [gid: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x, "
+                "mac: %02x%02x%02x%02x%02x%02x] "
+                "connected to remote "
+                "r[%d] handle [%d] psn %d qpn %6d ib [%d] "
+                "eth [gid: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x, "
+                "mac: %02x%02x%02x%02x%02x%02x] "
+                "qpIdx[%d]\n",
+                rank,
+                lclIdx,
+                global_rdma_ep_handles[lclIdx].psn,
+                global_rdma_ep_handles[lclIdx].qpn,
+                global_rdma_ep_handles[lclIdx].ib.lid,
+                global_rdma_ep_handles[lclIdx].eth.gid[ 0],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 1],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 2],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 3],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 4],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 5],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 6],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 7],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 8],
+                global_rdma_ep_handles[lclIdx].eth.gid[ 9],
+                global_rdma_ep_handles[lclIdx].eth.gid[10],
+                global_rdma_ep_handles[lclIdx].eth.gid[11],
+                global_rdma_ep_handles[lclIdx].eth.gid[12],
+                global_rdma_ep_handles[lclIdx].eth.gid[13],
+                global_rdma_ep_handles[lclIdx].eth.gid[14],
+                global_rdma_ep_handles[lclIdx].eth.gid[15],
+                global_rdma_ep_handles[lclIdx].eth.mac[0],
+                global_rdma_ep_handles[lclIdx].eth.mac[1],
+                global_rdma_ep_handles[lclIdx].eth.mac[2],
+                global_rdma_ep_handles[lclIdx].eth.mac[3],
+                global_rdma_ep_handles[lclIdx].eth.mac[4],
+                global_rdma_ep_handles[lclIdx].eth.mac[5],
+                r, rmtIdx,
+                global_rdma_ep_handles[rmtIdx].psn,
+                global_rdma_ep_handles[rmtIdx].qpn,
+                global_rdma_ep_handles[rmtIdx].ib.lid,
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 0],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 1],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 2],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 3],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 4],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 5],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 6],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 7],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 8],
+                global_rdma_ep_handles[rmtIdx].eth.gid[ 9],
+                global_rdma_ep_handles[rmtIdx].eth.gid[10],
+                global_rdma_ep_handles[rmtIdx].eth.gid[11],
+                global_rdma_ep_handles[rmtIdx].eth.gid[12],
+                global_rdma_ep_handles[rmtIdx].eth.gid[13],
+                global_rdma_ep_handles[rmtIdx].eth.gid[14],
+                global_rdma_ep_handles[rmtIdx].eth.gid[15],
+                global_rdma_ep_handles[rmtIdx].eth.mac[0],
+                global_rdma_ep_handles[rmtIdx].eth.mac[1],
+                global_rdma_ep_handles[rmtIdx].eth.mac[2],
+                global_rdma_ep_handles[rmtIdx].eth.mac[3],
+                global_rdma_ep_handles[rmtIdx].eth.mac[4],
+                global_rdma_ep_handles[rmtIdx].eth.mac[5],
+                IBGDA_QP2ID(r, qp)
+                );
+    }
+  }
+
+  // 4 Register buffer of rmda_buffer_ptr w/ num_rdma_bytes
+  RdmaMemoryRegion mr_handle = device_context->RegisterRdmaMemoryRegion(rmda_buffer_ptr, num_rdma_bytes, IBGDA_MR_ACCESS_FLAG);
+  EP_HOST_ASSERT(mr_handle.addr == (uintptr_t)rmda_buffer_ptr);
+  std::vector<RdmaMemoryRegion> global_mr_handles(nRanks);
+  global_mr_handles[rank] = mr_handle;
+  deep_ep::allGather(comm, global_mr_handles.data(), sizeof(RdmaMemoryRegion));
+
+  for (int r = 0; r < nRanks; r++) {
+    if (r == rank) {
+      ibgdaINFO("global r%-2d MR: addr 0x%lX lkey 0x%x rkey 0x%x length %ld from buff [%p, %ld, %08X] \n", r,
+                global_mr_handles[r].addr,
+                global_mr_handles[r].lkey,
+                global_mr_handles[r].rkey,
+                global_mr_handles[r].length,
+                rmda_buffer_ptr, num_rdma_bytes, IBGDA_MR_ACCESS_FLAG);
+    }else {
+      ibgdaINFO("global r%-2d MR: addr 0x%lX lkey 0x%x rkey 0x%x length %ld\n", r,
+                global_mr_handles[r].addr,
+                global_mr_handles[r].lkey,
+                global_mr_handles[r].rkey,
+                global_mr_handles[r].length);
+    }
+  }
+
+  // 5 topsMemcpy all ibgda informations into dest-ibgda-ptr
+  /***************************************************************************
+   * The endPoints saved for dstRank, total nRanks * nQps                    *
+   * The mrhandles_ saved for all Ranks, total nRanks * nQps, layout         *
+   ***************************************************************************
+   *          rank 0      --    + ------------+ <-- dev-ibgda_info_ptr START *
+   *               .            .             |    MemoryRegion              *
+   *          rank r      --    .             |                              *
+   *               .            .             |    MemoryRegion              *
+   *          rank N-1    --    + ------------+------------------------------*
+   *          rank 0      -- qp 0 ------------+  <----   ibgdaEndPointOffset  *
+   *                            1             |                              *
+   *                            .             |    EndPoint                  *
+   *                            .             |                              *
+   *                         qp n-1           |                              *
+   *          rank r      -- qp 0 ------------+                              *
+   *                            1             |                              *
+   *                            .             |    EndPoint                  *
+   *                            .             |                              *
+   *                         qp n-1           |                              *
+   *          rank N-1    -- qp 0 ------------+                              *
+   *                            1             |                              *
+   *                            .             |    EndPoint                  *
+   *                            .             |                              *
+   *                         qp n-1           +  <----------            END  *
+   ***************************************************************************/
+  // global mr_handles
+  uintptr_t offset = IBGDA_MR_OFFSET;
+  uintptr_t cpSize = sizeof(RdmaMemoryRegion) * nRanks;
+  TOPS_CHECK(topsMemcpy((void*)(ibgda_info_ptr + offset), global_mr_handles.data(), cpSize, topsMemcpyHostToDevice));
+
+  // local endpoints
+  offset = IBGDA_EP_OFFSET;
+  cpSize = sizeof(unified_endpoint) * nRanks * num_qps;
+  TOPS_CHECK(topsMemcpy((void*)(ibgda_info_ptr + offset), endpoints.data(), cpSize, topsMemcpyHostToDevice));
+
+  unified_endpoint_print(nRanks, num_qps, endpoints.data());
+
+#ifndef NO_IBGDA_TEST
+  // 6 rum write test with test_mr_handles, for MLX5 Only
+  ProviderType providerType = ProviderType::MLX5;
+  for (int r = 0; r < nRanks; r++) {
+    if (r == rank) continue;
+    for (int qp = 0; qp < num_qps; ++qp) {
+      // index for global_rdma_ep_handles[rank][r][qp];
+      RdmaEndpoint *rdmaEndPoint = reinterpret_cast<RdmaEndpoint*>(&(endpoints[r * num_qps + qp]));
+      if (ProviderType::MLX5 != rdmaEndPoint->GetProviderType()) {
+          providerType = ProviderType::Unknown;
+      }
+    }
+  }
+
+  if (ProviderType::MLX5 == providerType) {
+    uint64_t *testBuffer;
+    size_t testSize   = sizeof(uint64_t) * EP_MAX_RANKS * IBGDA_TEST_THREAD_NUM;
+    size_t testMrSize = sizeof(RdmaMemoryRegion) * EP_MAX_RANKS;
+    assert(testSize <= 0x1000000000ULL && "Error: testSize cannot exceed 64GB!");
+    TOPS_CHECK(topsExtMallocWithFlags((void **)&testBuffer, testSize + testMrSize, topsMallocHostAccessable));
+    TOPS_CHECK(topsMemset(testBuffer, 0x55, testSize));
+    for (int r = 0; r < EP_MAX_RANKS * IBGDA_TEST_THREAD_NUM; r++) testBuffer[r] = rank;
+
+    mr_handle = device_context->RegisterRdmaMemoryRegion(testBuffer, testSize, IBGDA_MR_ACCESS_FLAG);
+    std::vector<RdmaMemoryRegion> test_mr_handles(nRanks);
+    test_mr_handles[rank] = mr_handle;
+    deep_ep::allGather(comm, test_mr_handles.data(), sizeof(RdmaMemoryRegion));
+
+    for (int r = 0; r < nRanks; r++) {
+      ibgdaINFO("TEST r[%d] MR: addr 0x%lX lkey 0x%x rkey 0x%x length %ld\n", r, test_mr_handles[r].addr, test_mr_handles[r].lkey,
+        test_mr_handles[r].rkey, test_mr_handles[r].length);
+    }
+
+    // just do MLX5 testing, testing devEndpoints MUST same as kernel will using
+    RdmaMemoryRegion *devMrHandles = reinterpret_cast<RdmaMemoryRegion*>(testSize + (size_t)testBuffer);
+    unified_endpoint *devEndpoints = reinterpret_cast<unified_endpoint *>(ibgda_info_ptr + IBGDA_EP_OFFSET);
+    cpSize = nRanks * sizeof(RdmaMemoryRegion); // copy test_mr_handles into devMemory
+    TOPS_CHECK(topsMemcpy((void *)devMrHandles, test_mr_handles.data(), cpSize, topsMemcpyHostToDevice));
+
+    // using nRanks - 1 to write to others
+    int devId = -1;
+    topsDeviceProp_t devProp = {};
+    topsStream_t streamPtr = nullptr;
+    TOPS_CHECK(topsGetDevice(&devId));
+    TOPS_CHECK(topsGetDeviceProperties(&devProp, devId));
+    SETUP_LAUNCH_CONFIG(devProp.multiProcessorCount, devProp.maxThreadsPerBlock, IBGDA_TEST_SUB_THREAD_NUM, streamPtr);
+    TOPS_CHECK(topsLaunchKernelEx(&cfg, ibgda_gcu_test::testIbgdaWrite<ProviderType::MLX5>, devEndpoints, devMrHandles, rank, nRanks, num_qps));
+    TOPS_CHECK(topsDeviceSynchronize());
+    ibgda_gcu_test::ibgdaWriteVerify(testBuffer, rank, nRanks);
+    device_context->DeregisterRdmaMemoryRegion(testBuffer);
+    TOPS_CHECK(topsFree(testBuffer));
+  }
+
+#endif
+
+  // global ep_handles
+  // offset += MAX_IBGDA_MR_SIZE * EP_MAX_RANKS;
+  // cpSize = sizeof(RdmaEndpointHandle) * nRanks * nRanks * num_qps;
+  // TOPS_CHECK(topsMemcpy((void*)(ibgda_info_ptr + offset), global_rdma_ep_handles.data(), cpSize, topsMemcpyHostToDevice));
+  ibgdaCookieInfo *ibgdaInfos = reinterpret_cast<ibgdaCookieInfo*>(malloc(sizeof(ibgdaCookieInfo)));
+
+  EP_HOST_ASSERT(nullptr != ibgdaInfos);
+
+  ibgdaInfos->comm            = comm;
+  ibgdaInfos->rank            = rank;
+  ibgdaInfos->nRanks          = nRanks;
+  ibgdaInfos->rmda_buffer_ptr = rmda_buffer_ptr;
+  ibgdaInfos->num_rdma_bytes  = num_rdma_bytes;
+  ibgdaInfos->ibgda_info_ptr  = ibgda_info_ptr;
+  ibgdaInfos->rdma_context    = rdma_context;
+  ibgdaInfos->device          = device;
+  ibgdaInfos->device_context  = device_context;
+  ibgdaInfos->mr_handle       = global_mr_handles[rank];
+
+  device->Name().copy(ibgdaInfos->gdrDevName, IF_NAMESIZE);
+  EP_HOST_ASSERT(sizeof(RdmaEndpoint) * endpoints.size() <= sizeof(ibgdaInfos->endpoints));
+  memcpy(ibgdaInfos->endpoints, endpoints.data(), sizeof(RdmaEndpoint) * endpoints.size());
+
+  *ppCookie = ibgdaInfos->selfCookie = ibgdaInfos;
+
+#endif
+
+
+  // to avoid unused warning
+  (void)comm;
+  (void)rank;
+  (void)nRanks;
+  (void)rmda_buffer_ptr;
+  (void)num_rdma_bytes;
+
+  ibgdaINFO("HOST Setup IBGDA %s", (epSuccess == ret)?" Success!\n\n":" Failed!\n\n");
+
+  return ret;
+}
+
+} // namespace ibgda_gcu
+
+} // namespace deep_ep

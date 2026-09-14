@@ -1,0 +1,3634 @@
+#include <cstdio>
+#include <functional>
+#include <optional>
+#include <sys/types.h>
+
+#include <krt/builtins.h>
+#include <tops.h>
+#include "configs.h"
+#include "devcomm.h"
+#include "buffer.h"
+#include "exception.h"
+#include "launch.h"
+#include "utils.h"
+#include "ibgda_device.h"
+
+
+#define L3_MEM_STORE 0x98
+#define L1_SDMEM_STORE 0x91
+// #define DEEP_EP_NOTIFY_DISPATCH_DEBUG 1
+
+#define ESL_SWITCH(ESL, NAME, ...)    \
+  [&] {                               \
+    if (ESL == 2) {                   \
+      constexpr static int NAME = 2;  \
+      return __VA_ARGS__();           \
+    } else if (ESL == 4) {            \
+      constexpr static int NAME = 4;  \
+      return __VA_ARGS__();           \
+    } else if (ESL == 8) {            \
+      constexpr static int NAME = 8;  \
+      return __VA_ARGS__();           \
+    } else {                          \
+      EP_HOST_ASSERT(false and "Unsupported num_esl_ranks"); \
+    }                                 \
+  }()
+
+#define RDMA_SWITCH(RDMA, NAME, ...)   \
+  [&] {                                \
+    if (RDMA == 2) {                   \
+      constexpr static int NAME = 2;   \
+      return __VA_ARGS__();            \
+    } else if (RDMA == 4){             \
+      constexpr static int NAME = 4;   \
+      return __VA_ARGS__();            \
+    } else {                           \
+      EP_HOST_ASSERT(false and "Unsupported num_rdma_ranks"); \
+    }                                  \
+  }()
+
+
+namespace deep_ep {
+
+namespace internode {
+
+template <bool kLowLatencyMode>
+__forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, const int nvl_rank, const int num_nvl_ranks) {
+    return kLowLatencyMode ? (dst_rdma_rank * num_nvl_ranks + nvl_rank) : dst_rdma_rank;
+}
+
+// extern void * cpu_rdma_team;
+
+
+template <int num> struct RankType;
+template <> struct RankType<8> { using DT = long long; using VT = __vector long long; static constexpr int N = 64;};
+template <> struct RankType<4> { using DT = int; using VT  = __vector int; static constexpr int N = 128;};
+template <> struct RankType<2> { using DT = int16_t; using VT  = __vector short; static constexpr int N = 256;};
+
+struct SourceMeta {
+    int src_rdma_rank;
+    uint64_t is_token_in_nvl_rank_bits;
+
+    // The bitmask encodes one bit per intra-node NVL peer.  uint64_t supports up to
+    // 64 peers; in the internode kernel num_nvl_ranks is always ≤ 8 (one physical node),
+    // so 64 bits is more than sufficient even when NUM_MAX_NVL_PEERS > 64.
+    // TODO: add a static_assert on the actual NVL group size (e.g. kNumESLRanks ≤ 64)
+    // once the template parameter is threaded here; NUM_MAX_NVL_PEERS is the supernode
+    // capacity and is not the right guard for this bitmask.
+    static constexpr int kBitmaskWidth = (int)(sizeof(uint64_t) * 8); // 64
+
+    __forceinline__ SourceMeta() = default;
+
+    __device__ __forceinline__ SourceMeta(int rdma_rank, const bool* is_token_in_nvl_ranks) {
+        src_rdma_rank = rdma_rank;
+        is_token_in_nvl_rank_bits = (uint64_t)is_token_in_nvl_ranks[0];
+        #pragma unroll
+        // Cap at kBitmaskWidth (64) to avoid UB on uint64_t shift; internode
+        // num_nvl_ranks is always ≤ 8, so no information is lost.
+        for (int i = 1; i < std::min(NUM_MAX_NVL_PEERS, kBitmaskWidth); ++ i)
+            is_token_in_nvl_rank_bits |= (uint64_t)is_token_in_nvl_ranks[i] << i;
+    }
+
+    __device__ __forceinline__ bool is_token_in_nvl_rank(int nvl_rank) const {
+        return (is_token_in_nvl_rank_bits >> nvl_rank) & 1;
+    }
+};
+
+int get_source_meta_bytes() {
+    return sizeof(SourceMeta);
+}
+
+
+
+template <typename T>
+struct SymBufferView {
+   private:
+    uint8_t *send_ptr;
+    uint8_t *recv_ptr;
+    int64_t num_bytes;
+
+   public:
+    __device__ __forceinline__ SymBufferView(uint8_t *&global_ptr, int num_elems, int rank_num, int channel_num, int channel_id) {
+        num_bytes = num_elems * sizeof(T);
+        int64_t per_channel_bytes = rank_num * num_bytes;
+        recv_ptr = global_ptr + channel_id * per_channel_bytes;
+        send_ptr = global_ptr + (channel_id + channel_num) * per_channel_bytes;
+        total_bytes = 2 * channel_num * per_channel_bytes;
+        global_ptr += total_bytes;
+    }
+
+    __device__ __forceinline__ T *send_buffer(int rank) {
+        return (T *)(send_ptr + num_bytes * rank);
+    }
+
+    __device__ __forceinline__ T *recv_buffer(int rank) {
+        return (T *)(recv_ptr + num_bytes * rank);
+    }
+    int total_bytes;
+
+};
+
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+inline __device__ uint64_t Mlx5PostWriteDispatch(WorkQueueHandle &wq,
+                                                 uint32_t curPostIdx,
+                                                 bool cqeSignal,
+                                                 uint32_t qpn,
+                                                 uintptr_t laddr,
+                                                 uint64_t lkey,
+                                                 uintptr_t raddr,
+                                                 uint64_t rkey,
+                                                 size_t bytes,
+                                                 int fence) {
+    uint32_t opcode = MLX5_OPCODE_RDMA_WRITE;
+    uint8_t signalFlag = cqeSignal ? MLX5_WQE_CTRL_CQ_UPDATE : 0x00;
+    void *queueBuffAddr = wq.sqAddr;
+    uint32_t wqeNum = wq.sqWqeNum;
+
+    uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+    uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MLX5_SEND_WQE_SHIFT);
+
+    mlx5_wqe_ctrl_seg *wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg *>(wqeAddr);
+    wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | opcode);
+    wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | SendWqeNumOctoWords);
+
+    if (fence) {
+        signalFlag = signalFlag | MLX5_WQE_CTRL_FENCE;
+    }
+
+    wqeCtrlSeg->fm_ce_se = signalFlag;
+
+    mlx5_wqe_raddr_seg *wqeRaddrSeg = reinterpret_cast<mlx5_wqe_raddr_seg *>(wqeAddr + sizeof(mlx5_wqe_ctrl_seg));
+    wqeRaddrSeg->raddr = HTOBE64(raddr);
+    wqeRaddrSeg->rkey = HTOBE32(rkey);
+
+    mlx5_wqe_data_seg *wqeDataSeg =
+        reinterpret_cast<mlx5_wqe_data_seg *>(wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
+    wqeDataSeg->byte_count = HTOBE32(bytes);
+    wqeDataSeg->addr = HTOBE64(laddr);
+    wqeDataSeg->lkey = HTOBE32(lkey);
+
+    return reinterpret_cast<uint64_t *>(wqeCtrlSeg)[0];
+}
+
+__forceinline__ __device__ void ibgdaWriteDispatch(RdmaEndpoint &endPoint,
+                                                   RdmaMemoryRegion &sendMr,
+                                                   RdmaMemoryRegion &recvMr,
+                                                   size_t sendOffset,
+                                                   size_t recvOffset,
+                                                   size_t szToWrite,
+                                                   uint32_t curPostIdx,
+                                                   int fence,
+                                                   uint64_t &dbr_val,
+                                                   int is_first_wqe,
+                                                   bool force_cqe_signal) {
+    // uint32_t curPostIdx = tcle::atomic_add(&endPoint.wqHandle.postIdx, 1);
+
+    uintptr_t laddr = sendMr.addr + sendOffset;
+    uintptr_t raddr = recvMr.addr + recvOffset;
+
+    bool cqeSignal = ((0 == (curPostIdx & (IBGDA_CQE_STEP - 1))) && !is_first_wqe) || force_cqe_signal;
+    // bool cqeSignal = true;
+    dbr_val = Mlx5PostWriteDispatch(endPoint.wqHandle, curPostIdx, cqeSignal, endPoint.handle.qpn, laddr, sendMr.lkey, raddr,
+                                    recvMr.rkey, szToWrite, fence);
+
+    // tcle::fence<L3_MEM_STORE>();
+    // point to next free
+
+    // RingDoorbell write to L3 too
+    if (cqeSignal) { // szToWrite <= 1024
+        UpdateSendDbrRecord<ProviderType::MLX5>(endPoint.wqHandle.dbrRecAddr, curPostIdx + 1);
+        tcle::fence<L3_MEM_STORE>();
+        RingDoorbell<ProviderType::MLX5>(endPoint.wqHandle.dbrAddr, dbr_val);
+    } else {
+        return;
+    }
+
+    uint16_t wqeIdx;
+    int snd_opcode =
+        PollCq<ProviderType::MLX5>(endPoint.cqHandle.cqAddr, endPoint.cqHandle.cqeNum, &endPoint.cqHandle.consIdx, &wqeIdx);
+    endPoint.cqHandle.consIdx += 1;
+    ibgdaTRACE("send PollCq is done with snd_opcode %d, wqeIdx: %hu, consIdx %d, cqeNum %d\n", snd_opcode, wqeIdx,
+               endPoint.cqHandle.consIdx, endPoint.cqHandle.cqeNum);
+    static_cast<void>(snd_opcode);
+    UpdateCqDbrRecord<ProviderType::MLX5>(endPoint.cqHandle.dbrRecAddr, endPoint.cqHandle.consIdx, endPoint.cqHandle.cqeNum);
+    ibgdaTRACE("send UpdateCqDbrRecord is done\n");
+}
+
+// 一个类内聚：LARE(ESL) + IBGDA(RDMA) + per-dst bakery lock + Prim 接口
+#define AWUSERTOP_LINEAR_COPY 0
+#define SCF_REG_BASE 0x100000000ULL
+#define AP_REGS_AP_ETA_PACKET_INFO7_ADDR (SCF_REG_BASE + 0x2687e38ULL)
+#define OPCODE_WRITE 2
+
+struct roce_wqe {
+    __forceinline__ __device__ void init(unsigned int port,
+                                         unsigned int qp,
+                                         unsigned int wqeId,
+                                         void *dst,
+                                         void *src,
+                                         unsigned int len,
+                                         bool fence = false,
+                                         bool enableMsi = false) {
+        (void)enableMsi;
+
+        op_code = OPCODE_WRITE;
+
+        fence_end = 0;
+        enable_msg_interrupt = false;
+        enable_nnc = 1;
+        fence_start = fence;
+        rsv_flags = 0;
+
+        data_type = U32_DTYPE;
+        cas = 0;
+        scalar_or_vector = 0;
+        basic_or_extend = 0;
+        awatop = AWUSERTOP_LINEAR_COPY;
+        rsv_atomic_userbits = 0;
+
+        msn = wqeId;
+        dst_qp = 0;
+
+        pkt_len = len;
+
+        unsigned long long src_u64 = (unsigned long long)src;
+        unsigned long long dst_u64 = (unsigned long long)dst;
+
+        src_addr_low = (unsigned int)(src_u64 & 0xffffffffULL);
+        src_addr_high = (unsigned int)((src_u64 >> 32) & 0xffffffffULL);
+
+        dst_addr_low = (unsigned int)(dst_u64 & 0xffffffffULL);
+        dst_addr_high = (unsigned int)((dst_u64 >> 32) & 0xffffffffULL);
+
+        inline_data0 = 0;
+        inline_data1 = 0;
+
+        msi_addr_low = (unsigned int)(AP_REGS_AP_ETA_PACKET_INFO7_ADDR & 0xffffffffULL);
+        msi_addr_high = (unsigned int)((AP_REGS_AP_ETA_PACKET_INFO7_ADDR >> 32) & 0xffffffffULL);
+        msi_addr_data = (port << 8) + (qp & 0xff);
+
+        rd_resp_psn = 0;
+
+        reserve[0] = 0;
+        reserve[1] = 0;
+        reserve[2] = 0;
+    }
+
+    __forceinline__ __device__ void set_src(void *src) {
+        unsigned long long src_u64 = (unsigned long long)src;
+        src_addr_low = (unsigned int)(src_u64 & 0xffffffffULL);
+        src_addr_high = (unsigned int)((src_u64 >> 32) & 0xffffffffULL);
+    }
+
+    __forceinline__ __device__ void set_dst(void *dst) {
+        unsigned long long dst_u64 = (unsigned long long)dst;
+        dst_addr_low = (unsigned int)(dst_u64 & 0xffffffffULL);
+        dst_addr_high = (unsigned int)((dst_u64 >> 32) & 0xffffffffULL);
+    }
+
+    __forceinline__ __device__ void set_msi_addr_data(unsigned int port, unsigned int qp) {
+        msi_addr_data = (port << 8) + (qp & 0xff);
+    }
+
+    union {
+        struct {
+            unsigned int op_code : 8;
+
+            unsigned int fence_end : 1;
+            unsigned int enable_msg_interrupt : 1;
+            unsigned int enable_nnc : 1;
+            unsigned int fence_start : 1;
+            unsigned int rsv_flags : 4;
+
+            unsigned int data_type : 4;
+            unsigned int cas : 1;
+            unsigned int scalar_or_vector : 1;
+            unsigned int basic_or_extend : 1;
+            unsigned int awatop : 5;
+            unsigned int rsv_atomic_userbits : 4;
+
+            unsigned int msn : 16;
+            unsigned int dst_qp : 16;
+
+            unsigned int pkt_len;
+            unsigned int src_addr_low;
+            unsigned int src_addr_high;
+            unsigned int dst_addr_low;
+            unsigned int dst_addr_high;
+            unsigned int inline_data0;
+            unsigned int inline_data1;
+            unsigned int msi_addr_low;
+            unsigned int msi_addr_high;
+            unsigned int msi_addr_data;
+            unsigned int rd_resp_psn;
+            unsigned int reserve[3];
+        };
+        unsigned long long data[8];
+    };
+};
+
+template <int esl_rank_num, int rdma_rank_num, bool shared = false>
+class Prim {
+   public:
+    static constexpr int kDstCnt = esl_rank_num * rdma_rank_num;
+
+    // ------------------------ 轻量 BakeryLock（rdma_rank_num 参与者） ------------------------
+    struct BakeryLock {
+        volatile int choosing[rdma_rank_num];
+        volatile int ticket[rdma_rank_num];
+
+        __forceinline__ __device__ void init() {
+#pragma clang loop unroll(full)
+            for (int i = 0; i < rdma_rank_num; ++i) {
+                choosing[i] = 0;
+                ticket[i] = 0;
+            }
+        }
+
+        __forceinline__ __device__ void lock(int me) {
+            choosing[me] = 1;
+
+            int maxv = ticket[0];
+#pragma clang loop unroll(full)
+            for (int k = 1; k < rdma_rank_num; ++k) {
+                maxv = tcle::max(ticket[k], maxv);
+            }
+            ticket[me] = maxv + 1;
+
+            choosing[me] = 0;
+
+#pragma clang loop unroll(full)
+            for (int j = 0; j < rdma_rank_num; ++j) {
+                if (j == me)
+                    continue;
+
+                while (choosing[j]) {
+                }
+
+                while (ticket[j] != 0) {
+                    int tj = ticket[j];
+                    int tm = ticket[me];
+                    if (tj < tm || (tj == tm && j < me)) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        __forceinline__ __device__ void unlock(int me) {
+            ticket[me] = 0;
+        }
+    };
+
+    // ------------------------ LARE(ESL) engine ------------------------
+    class LareEngine {
+       public:
+        __device__ LareEngine() : waitId_(0), credit_(0) {
+        }
+        __device__ ~LareEngine() = default;
+
+        __forceinline__ __device__ void load(const lare_dev_info &info) {
+            waitId_ = tops::lare_get_wqe_slot(info.port_id, info.qp_id);
+            lare_dev_info_ = info;
+            credit_ = 0;
+        }
+
+        template <atomic_op_t OPS, typename D>
+        __forceinline__ __device__ void prep_trans_data(D *dst, D *src, size_t nelem) {
+            tops::lare_wrinfo wr;
+            wr.port = lare_dev_info_.port_id;
+            wr.qp = lare_dev_info_.qp_id;
+            wr.sq_baseaddr = lare_dev_info_.base_addr;
+            wr.sq_nelem = MAX_ROCE_SQELEM_NUM;
+            wr.dstAddr = reinterpret_cast<void *>(dst);
+            wr.srcAddr = reinterpret_cast<void *>(src);
+            wr.ops = OPS;
+            wr.data_type = getDataType<D>();
+            wr.data_nelem = nelem;
+            wr.fence = false;
+            wr.enableMsi = true;
+
+            uint32_t base_wqeId = (waitId_ + credit_) & (MAX_ROCE_SQELEM_NUM - 1);
+            tops::lare_write_wqe(base_wqeId, &wr);
+            credit_++;
+        }
+
+        template <atomic_op_t OPS, typename D, typename F>
+        __forceinline__ __device__ void prep_trans_data_flag(D *dst,
+                                                             D *src,
+                                                             size_t nelem,
+                                                             F *dst_flag,
+                                                             F *src_flag,
+                                                             roce_wqe &data_wqe) {
+            const uint32_t sq_nelem = MAX_ROCE_SQELEM_NUM;
+            const uint32_t mask = sq_nelem - 1;
+            const uint32_t wqe0 = (uint32_t)(waitId_ + credit_) & mask;
+            const uint32_t wqe1 = (wqe0 + 1) & mask;
+
+            data_wqe.set_dst((void *)dst);
+            data_wqe.set_src((void *)src);
+            data_wqe.pkt_len = (unsigned int)(nelem * sizeof(D));
+            data_wqe.msn = wqe0;
+            data_wqe.data_type = getDataType<D>();
+            __vector long long v_data_wqe = tcle::load<__vector long long>(&data_wqe);
+
+            data_wqe.set_dst(dst_flag);
+            data_wqe.set_src(src_flag);
+            data_wqe.pkt_len = (unsigned int)sizeof(F);
+            data_wqe.msn = wqe1;
+
+            data_wqe.data_type = getDataType<F>();
+
+            __vector long long v_flag_wqe = tcle::load<__vector long long>(&data_wqe);
+            tcle::store(v_data_wqe, (char *)lare_dev_info_.base_addr + (wqe0 << 6));
+            tcle::store(v_flag_wqe, (char *)lare_dev_info_.base_addr + (wqe1 << 6));
+            credit_ += 2;
+        }
+
+        __forceinline__ __device__ void ringDb() {
+            waitId_ = tops::lare_ring_db(lare_dev_info_.port_id, lare_dev_info_.qp_id, MAX_ROCE_SQELEM_NUM, waitId_, credit_);
+            credit_ = 0;
+        }
+
+        __forceinline__ __device__ void waitTransDone() {
+            (void)tops::lare_wait_done(lare_dev_info_.port_id, lare_dev_info_.qp_id, MAX_ROCE_SQELEM_NUM, waitId_, TIMEOUT);
+        }
+
+        volatile uint32_t waitId_;
+        volatile uint32_t credit_;
+        lare_dev_info lare_dev_info_;
+    };
+
+    // ------------------------ IBGDA(RDMA) engine ------------------------
+    class IbgdaEngine {
+       public:
+        __device__ IbgdaEngine() : provider_(ProviderType::Unknown), endPoint_(nullptr), postIdx_(0) {
+        }
+        __device__ ~IbgdaEngine() = default;
+
+        __forceinline__ __device__ void load(uintptr_t ibgda_info_ptr, int qpId, int nQps, int lRank, int rRank) {
+            RdmaMemoryRegion *mrhandles = reinterpret_cast<RdmaMemoryRegion *>(ibgda_info_ptr + IBGDA_MR_OFFSET);
+            unified_endpoint *endpoints = reinterpret_cast<unified_endpoint *>(ibgda_info_ptr + IBGDA_EP_OFFSET);
+
+            transferGlobaltoStackUnaligned((T_U64 *)(mrHdls_ + SEND), mrhandles + lRank);
+            transferGlobaltoStackUnaligned((T_U64 *)(mrHdls_ + RECV), mrhandles + rRank);
+
+            endPoint_ = (RdmaEndpoint *)&((endpoints + rRank * nQps + qpId)->ibgda_storage);
+            // `postIdx_` is a software producer index. We expect single-producer semantics per endpoint/QP.
+            postIdx_ = endPoint_->wqHandle.postIdx;
+            provider_ = endPoint_->GetProviderType();
+
+            if (provider_ == ProviderType::Unknown) {
+                printf("%s %d Unknown ProviderType\n", __FUNCTION__, __LINE__);
+            }
+            is_first_cqe = 1;
+        }
+
+        template <typename T>
+        __forceinline__ __device__ bool send(T *dst, T *src, size_t nelem, int fence, bool force_cqe_signal = false) {
+            uint64_t srcOffs = (uint64_t)src - mrHdls_[SEND].addr;
+            uint64_t dstOffs = (uint64_t)dst - mrHdls_[RECV].addr;
+            size_t bytes = nelem * sizeof(T);
+
+            // if (!(srcOffs + bytes < mrHdls_[SEND].length && dstOffs + bytes < mrHdls_[RECV].length)) {
+            //     printf("%s %d OOR, SA 0x%lX DA 0x%lx nelem=%ld\n", __FUNCTION__, __LINE__, (uint64_t)src, (uint64_t)dst, nelem);
+            //     return false;
+            // }
+
+            // if (provider_ == ProviderType::MLX5) {
+            ibgdaWriteDispatch(*endPoint_, mrHdls_[SEND], mrHdls_[RECV], srcOffs, dstOffs, bytes, postIdx_, fence, dbr_val,
+                               is_first_cqe, force_cqe_signal);
+            is_first_cqe = 0;
+            // } else {
+            //     printf("%s %d Unknown ProviderType\n", __FUNCTION__, __LINE__);
+            //     return false;
+            // }
+
+            postIdx_++;
+            endPoint_->wqHandle.postIdx = postIdx_;
+            return true;
+        }
+
+        __forceinline__ __device__ void ringDb() {
+            // tcle::fence<L3_MEM_STORE>();
+            UpdateSendDbrRecord<ProviderType::MLX5>(endPoint_->wqHandle.dbrRecAddr, postIdx_ + 1);
+            tcle::fence<L3_MEM_STORE>();
+            RingDoorbell<ProviderType::MLX5>(endPoint_->wqHandle.dbrAddr, dbr_val);
+        }
+
+        __forceinline__ __device__ void waitTransDone() {
+        }
+
+       private:
+        ProviderType provider_;
+        RdmaMemoryRegion mrHdls_[MAX_SIDES];
+        RdmaEndpoint *endPoint_;
+        uint32_t postIdx_;
+        uint64_t dbr_val;
+        int is_first_cqe;
+    };
+
+   public:
+    __forceinline__ __device__ void init_esl(primitive *esl_infos, int rank, uint8_t **buffer_ptrs) {
+        uint8_t *base = buffer_ptrs[rank % esl_rank_num];
+        int base_rank = (rank / esl_rank_num) * esl_rank_num;
+#pragma clang loop unroll(full)
+        for (int dst_esl_rank = 0; dst_esl_rank < esl_rank_num; dst_esl_rank++) {
+            int dst_rank = base_rank + dst_esl_rank;
+            if(dst_rank == rank) continue;
+            esl_engines_[dst_esl_rank].load(esl_infos[dst_rank].lare_dev_info);
+            buffer_offset_[dst_esl_rank] = buffer_ptrs[dst_rank % esl_rank_num] - base;
+            unfinished_[dst_esl_rank] = 0;
+            if constexpr (shared) {
+                esl_lock_[dst_esl_rank].init();
+            }
+        }
+
+        rdma_peer_rank_ = -1;
+        rdma_buffer_offset_ = 0;
+    }
+
+    __forceinline__ __device__ void init_rdma(primitives *infos,
+                                              int rank,
+                                              int dst_rank,
+                                              int channel_id,
+                                              uint8_t * /*rdma_buffer_ptr*/) {
+        rdma_peer_rank_ = dst_rank;
+        if (dst_rank == rank) return;
+
+        uintptr_t ibgda_info_ptr = (uintptr_t)infos->ibgda_info_ptr;
+        rdma_engine_.load(ibgda_info_ptr, channel_id, MAX_IBGDA_QP_NUMS, rank, dst_rank);
+
+        rdma_buffer_offset_ = (uint8_t *)(infos->rdma_peer_base[dst_rank]) - (uint8_t *)(infos->rdma_peer_base[rank]);
+    }
+
+    // ESL 发送
+    template <typename T>
+    __forceinline__ __device__ void send_esl(const T *dst_ptr, T *src_ptr, int dst_rank, int nelem, int fowarder_id = 0) {
+        int dst_esl_rank = dst_rank % esl_rank_num;
+        if constexpr (shared) {
+            esl_lock_[dst_esl_rank].lock(fowarder_id);
+        }
+
+        if (unfinished_[dst_esl_rank] >= MAX_ROCE_SQELEM_NUM) {
+            esl_engines_[dst_esl_rank].waitTransDone();
+            unfinished_[dst_esl_rank] = 0;
+        }
+        unfinished_[dst_esl_rank]++;
+
+        esl_engines_[dst_esl_rank].template prep_trans_data<NON_ATOMIC_OPERATION>(
+            (T *)((uint8_t *)dst_ptr + buffer_offset_[dst_esl_rank]), src_ptr, nelem);
+
+        if constexpr (shared) {
+            tcle::fence<L1_SDMEM_STORE>();
+            tcle::fence<L3_MEM_STORE>();
+            esl_lock_[dst_esl_rank].unlock(fowarder_id);
+        }
+    }
+
+    template <typename T>
+    __forceinline__ __device__ void send_esl_and_ring(const T *dst_ptr,
+                                                      T *src_ptr,
+                                                      int dst_rank,
+                                                      int nelem,
+                                                      int fowarder_id = 0) {
+        int dst_esl_rank = dst_rank % esl_rank_num;
+        if constexpr (shared) {
+            esl_lock_[dst_esl_rank].lock(fowarder_id);
+        }
+
+        if (unfinished_[dst_esl_rank] >= MAX_ROCE_SQELEM_NUM) {
+            esl_engines_[dst_esl_rank].waitTransDone();
+            unfinished_[dst_esl_rank] = 0;
+        }
+        unfinished_[dst_esl_rank]++;
+
+        esl_engines_[dst_esl_rank].template prep_trans_data<NON_ATOMIC_OPERATION>(
+            (T *)((uint8_t *)dst_ptr + buffer_offset_[dst_esl_rank]), src_ptr, nelem);
+        tcle::fence<L3_MEM_STORE>();
+        esl_engines_[dst_esl_rank].ringDb();
+        if constexpr (shared) {
+            tcle::fence<L1_SDMEM_STORE>();
+            esl_lock_[dst_esl_rank].unlock(fowarder_id);
+        }
+    }
+
+    __forceinline__ __device__ void wait_esl_trans_done(int dst_rank) {
+        int dst_esl_rank = dst_rank % esl_rank_num;
+        esl_engines_[dst_esl_rank].waitTransDone();
+    }
+
+    // // token 的 data 与 tail 分两条 WQE（data WQE + flag WQE），并在同一次 ringDb 推出
+    // template <typename D, typename F>
+    // __attribute__((noinline)) __device__ void send_esl_dataflag_and_ring(
+    //     const D *dst_ptr, // 对端对称 recv buffer 的 token 起始
+    //     D *src_ptr, // 本端 send buffer 的 token 起始
+    //     int dst_rank,
+    //     size_t data_nelem, // data 部分元素个数（不包含 tail 区），对 uint8_t 就是 data_bytes
+    //     int forwarder_id = 0) {
+    //     int dst_esl_rank = dst_rank % esl_rank_num;
+
+    //     if constexpr (shared) {
+    //         esl_lock_[dst_esl_rank].lock(forwarder_id);
+    //     }
+
+    //     // 本次要消耗 2 个 WQE（data + flag）
+    //     if (unfinished_[dst_esl_rank] + 2 > MAX_ROCE_SQELEM_NUM) {
+    //         esl_engines_[dst_esl_rank].waitTransDone();
+    //         unfinished_[dst_esl_rank] = 0;
+    //     }
+    //     unfinished_[dst_esl_rank] += 2;
+
+    //     // dst 需要加上对端基址偏移（你原来 send_esl 的做法）
+    //     D *dst = (D *)((uint8_t *)dst_ptr + buffer_offset_[dst_esl_rank]);
+    //     D *src = src_ptr;
+
+    //     // flag 地址放在 data 尾部（即 tail_stamp 所在位置）
+    //     F *dst_flag = (F *)((uint8_t *)dst + data_nelem * sizeof(D));
+    //     F *src_flag = (F *)((uint8_t *)src + data_nelem * sizeof(D));
+
+    //     // 连续写入两条 WQE：data + flag
+    //     esl_engines_[dst_esl_rank].template prep_trans_data_flag<NON_ATOMIC_OPERATION, D, F>(dst, src, data_nelem, dst_flag,
+    //                                                                                          src_flag);
+
+    //     // doorbell 前保证 src data/src_flag 已写入并对 NIC 可见
+    //     tcle::fence<L3_MEM_STORE>();
+    //     esl_engines_[dst_esl_rank].ringDb();
+
+    //     if constexpr (shared) {
+    //         tcle::fence<L1_SDMEM_STORE>();
+    //         esl_lock_[dst_esl_rank].unlock(forwarder_id);
+    //     }
+    // }
+
+    // RDMA 发送
+    template <typename T>
+    __forceinline__ __device__ void send_rdma(const T *dst_ptr, T *src_ptr, int dst_rank, int nelem,
+                                              int fence = 0, bool force_cqe_signal = false) {
+        rdma_engine_.template send((T *)((uint8_t *)dst_ptr + rdma_buffer_offset_), src_ptr, nelem, fence, force_cqe_signal);
+    }
+
+    __forceinline__ __device__ void ring_doorbell_rdma() {
+        rdma_engine_.ringDb();
+    }
+
+    __forceinline__ __device__ void ring_doorbell(int dst_rank, int forwader_id = 0) {
+        int dst_esl_rank = dst_rank % esl_rank_num;
+        if constexpr (shared) {
+            esl_lock_[dst_esl_rank].lock(forwader_id);
+        }
+        tcle::fence<L3_MEM_STORE>();
+        esl_engines_[dst_esl_rank].ringDb();
+        if constexpr (shared) {
+            tcle::fence<L1_SDMEM_STORE>();
+            esl_lock_[dst_esl_rank].unlock(forwader_id);
+        }
+    }
+
+    // ESL
+    LareEngine esl_engines_[esl_rank_num];
+    long long buffer_offset_[esl_rank_num];
+    volatile int unfinished_[esl_rank_num];
+
+    // RDMA
+    IbgdaEngine rdma_engine_;
+    long long rdma_buffer_offset_;
+    int rdma_peer_rank_;
+
+    BakeryLock esl_lock_[esl_rank_num];
+};
+
+template <bool kLowLatencyMode, int kNumESLRanks, int kNumRDMARanks>
+__global__ void notify_dispatch(
+    const int* num_tokens_per_rank,
+    int* moe_recv_counter_mapped,
+    int num_ranks,
+    const int* num_tokens_per_rdma_rank,
+    int* moe_recv_rdma_counter_mapped,
+    const int* num_tokens_per_expert,
+    int* moe_recv_expert_counter_mapped,
+    int num_experts,
+    const bool* is_token_in_rank,
+    int num_tokens,
+    int num_worst_tokens,
+    int num_channels,
+    int expert_alignment,
+    int* rdma_channel_prefix_matrix,
+    int* recv_rdma_rank_prefix_sum,
+    int* gbl_channel_prefix_matrix,
+    int* recv_gbl_rank_prefix_sum,
+    void* rdma_buffer_ptr,
+    void** buffer_ptrs,
+    int rank,
+    int num_nvl_ranks,
+    struct primitives* prims) {
+    const int sm_id = static_cast<int>(threadIdx.x) +
+                      static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x);
+    const int subthread_id = static_cast<int>(subThreadIdx.x);
+    const int num_subthreads = static_cast<int>(threadDim.x);
+
+    // void* const rdma_buffer_base_ptr = rdma_buffer_ptr;
+    void* rdma_buffer_ptr_moving = rdma_buffer_ptr;
+
+    const int rdma_rank = rank / num_nvl_ranks;
+    const int nvl_rank  = rank % num_nvl_ranks;
+
+    const int num_rdma_experts = num_experts / kNumRDMARanks;
+    const int num_nvl_experts  = num_rdma_experts / num_nvl_ranks;
+
+    long long time1 = 0, time2 = 0, time3 = 0, time4 = 0, time5 = 0, time6 = 0;
+    long long time7 = 0, time8 = 0, time9 = 0;
+    // Timeout watchdog for busy-wait loops inside notify_dispatch kernel.
+    // 40G cycles ~= 20 seconds (assumes ~2GHz clock, consistent with `configs.h` comments).
+    static constexpr uint64_t kNotifyDispatchTimeoutCycles = NUM_TIMEOUT_CYCLES;
+    
+
+    if (sm_id == 0) {
+        tops::private_dte engine;
+        engine.init();
+
+        Prim<kNumESLRanks, kNumRDMARanks> prim;
+        prim.init_esl(prims[sm_id].primitive, rank, reinterpret_cast<uint8_t**>(buffer_ptrs));
+
+        if (subthread_id == 0) time1 = tops::clock64();
+
+        auto rdma_recv_num_tokens_mixed = SymBuffer<int>(
+            rdma_buffer_ptr_moving,
+            num_nvl_ranks + num_rdma_experts + 1 + 1,
+            kNumRDMARanks);
+
+        const int rdma_count_idx = num_nvl_ranks + num_rdma_experts;
+        const int flag_idx       = rdma_count_idx + 1;
+
+        #pragma unroll
+        for (int i = subthread_id; i < num_ranks; i += num_subthreads) {
+            rdma_recv_num_tokens_mixed.send_buffer(i / num_nvl_ranks)[i % num_nvl_ranks] =
+                num_tokens_per_rank[i];
+        }
+
+        #pragma unroll
+        for (int i = subthread_id; i < num_experts; i += num_subthreads) {
+            rdma_recv_num_tokens_mixed.send_buffer(i / num_rdma_experts)
+                [num_nvl_ranks + i % num_rdma_experts] = num_tokens_per_expert[i];
+        }
+
+        if (subthread_id < kNumRDMARanks) {
+            rdma_recv_num_tokens_mixed.send_buffer(subthread_id)[rdma_count_idx] =
+                num_tokens_per_rdma_rank[subthread_id];
+            rdma_recv_num_tokens_mixed.send_buffer(subthread_id)[flag_idx] =
+                -num_tokens_per_rdma_rank[subthread_id] - 1;
+        }
+
+        __syncsubthreads();
+        if (subthread_id == 0) time2 = tops::clock64();
+
+        for (int i = subthread_id; i < kNumRDMARanks; i += num_subthreads) {
+            if (i != rdma_rank) {
+                const int dst_global_rank = nvl_rank + i * num_nvl_ranks;
+                prim.init_rdma(&prims[sm_id], rank, dst_global_rank, sm_id,
+                               reinterpret_cast<uint8_t*>(rdma_buffer_ptr));
+
+                prim.send_rdma(
+                    reinterpret_cast<uint8_t*>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)),
+                    reinterpret_cast<uint8_t*>(rdma_recv_num_tokens_mixed.send_buffer(i)),
+                    dst_global_rank,
+                    (num_nvl_ranks + num_rdma_experts + 1) * (int)sizeof(int));
+
+                prim.send_rdma(
+                    &rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)[flag_idx],
+                    &rdma_recv_num_tokens_mixed.send_buffer(i)[flag_idx],
+                    dst_global_rank,
+                    1);
+
+                prim.ring_doorbell_rdma();
+            } else {
+                const size_t num_bytes_per_msg =
+                    (num_nvl_ranks + num_rdma_experts + 1) * sizeof(int);
+
+                memcpyGtoG(
+                    engine,
+                    reinterpret_cast<uint8_t*>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)),
+                    reinterpret_cast<uint8_t*>(rdma_recv_num_tokens_mixed.send_buffer(i)),
+                    (ssize_t)num_bytes_per_msg);
+
+                reinterpret_cast<volatile int*>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank))[flag_idx] =
+                    rdma_recv_num_tokens_mixed.send_buffer(rdma_rank)[flag_idx];
+            }
+        }
+
+        for (int i = subthread_id; i < kNumRDMARanks; i += num_subthreads) {
+            volatile int* rdma_flag_ptr =
+                reinterpret_cast<volatile int*>(&rdma_recv_num_tokens_mixed.recv_buffer(i)[flag_idx]);
+            uint64_t wait_rdma_flag_start = tops::clock64();
+            bool wait_rdma_flag_timed_out_printed = false;
+            while (*rdma_flag_ptr == 0) {
+                if (!wait_rdma_flag_timed_out_printed &&
+                    (tops::clock64() - wait_rdma_flag_start > kNotifyDispatchTimeoutCycles)) {
+                    printf("[notify_dispatch][timeup>20s][wait rdma flag] rank=%d sm_id=%d subthread_id=%d rdma_rank=%d "
+                           "wait_on_rdma_rank=%d flag_idx=%d flag_val=%d\n",
+                           rank, sm_id, subthread_id, rdma_rank,
+                           i, flag_idx, static_cast<int>(*rdma_flag_ptr));
+                    wait_rdma_flag_timed_out_printed = true;
+                }
+            }
+            *rdma_flag_ptr = 0;
+        }
+
+        __syncsubthreads();
+        if (subthread_id == 0) time3 = tops::clock64();
+
+        void* nvl_send_buffer = (subthread_id < num_nvl_ranks) ? buffer_ptrs[subthread_id] : nullptr;
+        void* nvl_recv_buffer = buffer_ptrs[nvl_rank];
+
+        auto nvl_reduced_num_tokens_per_expert =
+            Buffer<int>(nvl_recv_buffer, num_rdma_experts).advance_also(nvl_send_buffer);
+
+        constexpr int kNumNvlPayloadHeader = 1;
+        const int nvl_payload_elems = kNumRDMARanks + num_nvl_experts + kNumNvlPayloadHeader;
+        const int nvl_payload_flag_idx = kNumRDMARanks + num_nvl_experts;
+
+        auto nvl_send_num_tokens_payload = AsymBuffer<int>(nvl_send_buffer, nvl_payload_elems, num_nvl_ranks);
+        auto nvl_recv_num_tokens_payload = AsymBuffer<int>(nvl_recv_buffer, nvl_payload_elems, num_nvl_ranks);
+
+        auto tmp_num_tokens_payload =
+            AsymBuffer<int>(nvl_recv_buffer, kNumRDMARanks + num_nvl_experts, num_nvl_ranks);
+        auto tmp_payload_flag =
+            AsymBuffer<int>(nvl_recv_buffer, 1, num_nvl_ranks);
+
+        for (int i = subthread_id; i < num_rdma_experts; i += num_subthreads) {
+            int sum = 0;
+            #pragma unroll
+            for (int r = 0; r < kNumRDMARanks; ++r) {
+                sum += rdma_recv_num_tokens_mixed.recv_buffer(r)[num_nvl_ranks + i];
+            }
+            nvl_reduced_num_tokens_per_expert[i] = sum;
+        }
+
+        __syncsubthreads();
+
+        if (subthread_id == 0) {
+            int sum = 0;
+            #pragma unroll
+            for (int i = 0; i < kNumRDMARanks; ++i) {
+                sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[rdma_count_idx];
+                recv_rdma_rank_prefix_sum[i] = sum;
+            }
+
+            if (num_worst_tokens == 0) {
+                uint64_t wait_recv_rdma_counter_start = tops::clock64();
+                bool wait_recv_rdma_counter_timed_out_printed = false;
+                while (*(volatile int*)(moe_recv_rdma_counter_mapped) != -1) {
+                    if (!wait_recv_rdma_counter_timed_out_printed &&
+                        (tops::clock64() - wait_recv_rdma_counter_start > kNotifyDispatchTimeoutCycles)) {
+                        printf("[notify_dispatch][timeup>20s][wait moe_recv_rdma_counter] rank=%d sm_id=%d rdma_rank=%d "
+                               "counter_val=%d expected=-1 sum_to_write=%d\n",
+                               rank, sm_id, rdma_rank,
+                               *(volatile int*)(moe_recv_rdma_counter_mapped), sum);
+                        wait_recv_rdma_counter_timed_out_printed = true;
+                    }
+                }
+                *moe_recv_rdma_counter_mapped = sum;
+            }
+        }
+
+        if (subthread_id == 0) time4 = tops::clock64();
+
+        if (subthread_id < num_nvl_ranks) {
+            int* local_num_tokens_payload = tmp_num_tokens_payload.buffer(subthread_id);
+            int* payload_flag = tmp_payload_flag.buffer(subthread_id);
+
+            *payload_flag = -(kNumRDMARanks + num_nvl_experts) - 1;
+
+            #pragma unroll
+            for (int i = 0; i < kNumRDMARanks; ++i) {
+                local_num_tokens_payload[i] = rdma_recv_num_tokens_mixed.recv_buffer(i)[subthread_id];
+            }
+
+            const int dst_global_rank = subthread_id;
+
+            #pragma unroll
+            for (int i = 0; i < num_nvl_experts; ++i) {
+                local_num_tokens_payload[kNumRDMARanks + i] =
+                    nvl_reduced_num_tokens_per_expert[subthread_id * num_nvl_experts + i];
+            }
+
+            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+
+            if (subthread_id != nvl_rank) {
+                prim.send_esl(
+                    nvl_recv_num_tokens_payload.buffer(nvl_rank),
+                    local_num_tokens_payload,
+                    dst_global_rank,
+                    kNumRDMARanks + num_nvl_experts);
+
+                prim.send_esl(
+                    &nvl_recv_num_tokens_payload.buffer(nvl_rank)[nvl_payload_flag_idx],
+                    payload_flag,
+                    dst_global_rank,
+                    1);
+
+                prim.ring_doorbell(dst_global_rank);
+                prim.wait_esl_trans_done(dst_global_rank);
+            } else {
+                memcpyGtoG(
+                    engine,
+                    reinterpret_cast<uint8_t*>(nvl_send_num_tokens_payload.buffer(nvl_rank)),
+                    reinterpret_cast<uint8_t*>(local_num_tokens_payload),
+                    (kNumRDMARanks + num_nvl_experts) * sizeof(int));
+
+                reinterpret_cast<volatile int*>(nvl_send_num_tokens_payload.buffer(nvl_rank))[nvl_payload_flag_idx] =
+                    *payload_flag;
+            }
+        }
+
+        for (int i = subthread_id; i < num_nvl_ranks; i += num_subthreads) {
+            volatile int* payload_flag_ptr =
+                reinterpret_cast<volatile int*>(&nvl_recv_num_tokens_payload.buffer(i)[nvl_payload_flag_idx]);
+            uint64_t wait_nvl_payload_flag_start = tops::clock64();
+            bool wait_nvl_payload_flag_timed_out_printed = false;
+            while (*payload_flag_ptr == 0) {
+                if (!wait_nvl_payload_flag_timed_out_printed &&
+                    (tops::clock64() - wait_nvl_payload_flag_start > kNotifyDispatchTimeoutCycles)) {
+                    printf("[notify_dispatch][timeup>20s][wait nvl payload flag] rank=%d sm_id=%d subthread_id=%d rdma_rank=%d "
+                           "wait_on_nvl_rank=%d flag_idx=%d flag_val=%d\n",
+                           rank, sm_id, subthread_id, rdma_rank,
+                           i, nvl_payload_flag_idx, static_cast<int>(*payload_flag_ptr));
+                    wait_nvl_payload_flag_timed_out_printed = true;
+                }
+            }
+            // __gcu_get_spr_barrier(BARRIER_MASK_L3);
+            *payload_flag_ptr = 0;
+        }
+
+        __syncsubthreads();
+        if (subthread_id == 0) time5 = tops::clock64();
+
+        if (subthread_id == 0) {
+            int sum = 0;
+            #pragma unroll
+            for (int i = 0; i < num_ranks; ++i) {
+                const int src_rdma_rank = i / num_nvl_ranks;
+                const int src_nvl_rank  = i % num_nvl_ranks;
+                sum += nvl_recv_num_tokens_payload.buffer(src_nvl_rank)[src_rdma_rank];
+                recv_gbl_rank_prefix_sum[i] = sum;
+            }
+
+            if (num_worst_tokens == 0) {
+                uint64_t wait_recv_counter_start = tops::clock64();
+                bool wait_recv_counter_timed_out_printed = false;
+                while (*(volatile int*)(moe_recv_counter_mapped) != -1) {
+                    if (!wait_recv_counter_timed_out_printed &&
+                        (tops::clock64() - wait_recv_counter_start > kNotifyDispatchTimeoutCycles)) {
+                        printf("[notify_dispatch][timeup>20s][wait moe_recv_counter] rank=%d sm_id=%d rdma_rank=%d "
+                               "counter_val=%d expected=-1 sum_to_write=%d\n",
+                               rank, sm_id, rdma_rank,
+                               *(volatile int*)(moe_recv_counter_mapped), sum);
+                        wait_recv_counter_timed_out_printed = true;
+                    }
+                }
+                *moe_recv_counter_mapped = sum;
+            }
+        }
+
+        for (int threadid = subthread_id; threadid < num_nvl_experts; threadid += num_subthreads) {
+            int sum = 0;
+            #pragma unroll
+            for (int i = 0; i < num_nvl_ranks; ++i) {
+                sum += nvl_recv_num_tokens_payload.buffer(i)[kNumRDMARanks + threadid];
+            }
+
+            sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
+
+            if (num_worst_tokens == 0) {
+                uint64_t wait_expert_counter_start = tops::clock64();
+                bool wait_expert_counter_timed_out_printed = false;
+                while (*(volatile int*)(moe_recv_expert_counter_mapped + threadid) != -1) {
+                    if (!wait_expert_counter_timed_out_printed &&
+                        (tops::clock64() - wait_expert_counter_start > kNotifyDispatchTimeoutCycles)) {
+                        printf("[notify_dispatch][timeup>20s][wait moe_recv_expert_counter] rank=%d sm_id=%d rdma_rank=%d "
+                               "expert_id=%d counter_val=%d expected=-1 sum_to_write=%d\n",
+                               rank, sm_id, rdma_rank,
+                               threadid,
+                               *(volatile int*)(moe_recv_expert_counter_mapped + threadid),
+                               sum);
+                        wait_expert_counter_timed_out_printed = true;
+                    }
+                }
+                moe_recv_expert_counter_mapped[threadid] = sum;
+            }
+        }
+
+        __syncsubthreads();
+        if (subthread_id == 0) time6 = tops::clock64();
+
+        // if (subthread_id == 0) {
+        //     printf(
+        //         "prepare rdma data: %lld, rdma send and wait: %lld, prepare nvl data: %lld, "
+        //         "nvl send and wait: %lld, last write: %lld total: %lld\n",
+        //         time2 - time1,
+        //         time3 - time2,
+        //         time4 - time3,
+        //         time5 - time4,
+        //         time6 - time5,
+        //         time6 - time1);
+        // }
+    } else {
+        if (subthread_id == 0) time7 = tops::clock64();
+
+        const int dst_rdma_rank = sm_id - 1;
+        if (dst_rdma_rank < kNumRDMARanks) {
+            for (int channel_id = subthread_id; channel_id < num_channels; channel_id += num_subthreads) {
+                int token_start_idx, token_end_idx;
+                get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+
+                int total_count = 0;
+                int per_nvl_rank_count[kNumESLRanks] = {0};
+
+                for (int64_t i = token_start_idx; i < token_end_idx; ++i) {
+
+                    if constexpr (kNumESLRanks != 8) {
+                        const bool* is_token_in_rank_values = is_token_in_rank + i * num_ranks + dst_rdma_rank * num_nvl_ranks;
+                        int has_any = 0;
+                        #pragma unroll
+                        for (int j = 0; j < num_nvl_ranks; ++j) {
+                            per_nvl_rank_count[j] += is_token_in_rank_values[j];
+                            has_any |= is_token_in_rank_values[j];
+                        }
+                        total_count += has_any;
+                    } else {
+                        auto is_token_in_rank_u64 =
+                            *reinterpret_cast<const uint64_t*>(
+                                is_token_in_rank + i * num_ranks + dst_rdma_rank * num_nvl_ranks);
+
+                        total_count += static_cast<int>(is_token_in_rank_u64 != 0);
+
+                        #pragma unroll
+                        for (int bit = 0; bit < num_nvl_ranks; ++bit) {
+                            per_nvl_rank_count[bit] +=
+                                static_cast<int>((is_token_in_rank_u64 >> (bit * 8)) & 0x1);
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int i = 0; i < num_nvl_ranks; ++i) {
+                    gbl_channel_prefix_matrix[(dst_rdma_rank * num_nvl_ranks + i) * num_channels + channel_id] =
+                        per_nvl_rank_count[i];
+                }
+                rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] = total_count;
+            }
+        }
+
+        __syncsubthreads();
+        if (subthread_id == 0) time8 = tops::clock64();
+
+        if (dst_rdma_rank < kNumRDMARanks) {
+            if (subthread_id == 0) {
+                int* prefix_row = rdma_channel_prefix_matrix + dst_rdma_rank * num_channels;
+                #pragma unroll
+                for (int i = 1; i < num_channels; ++i) {
+                    prefix_row[i] += prefix_row[i - 1];
+                }
+            }
+
+            for (int thread_id = subthread_id; thread_id < num_nvl_ranks; thread_id += num_subthreads) {
+                int* prefix_row =
+                    gbl_channel_prefix_matrix + (dst_rdma_rank * num_nvl_ranks + thread_id) * num_channels;
+                #pragma unroll
+                for (int i = 1; i < num_channels; ++i) {
+                    prefix_row[i] += prefix_row[i - 1];
+                }
+            }
+        }
+
+        __syncsubthreads();
+        if (subthread_id == 0) time9 = tops::clock64();
+
+        // if (subthread_id == 0 && dst_rdma_rank < kNumRDMARanks) {
+        //     printf("calculate channel count: %lld calculate channel prefix: %lld total: %lld\n",
+        //            time8 - time7, time9 - time8, time9 - time7);
+        // }
+    }
+}
+
+void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
+    int num_nvl_ranks,
+    const int* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
+    const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
+    const bool* is_token_in_rank, int num_tokens, int num_worst_tokens, int num_channels,
+    int num_device_sms, int max_threads_per_sm,
+    int hidden_int4, int num_scales, int num_topk, int expert_alignment,
+    int* rdma_channel_prefix_matrix, int* recv_rdma_rank_prefix_sum,
+    int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
+    void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens,
+    void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
+    int** barrier_signal_ptrs, int rank,
+    topsStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
+    bool low_latency_mode,
+    struct primitives* prims) {
+
+#define NOTIFY_DISPATCH_LAUNCH_CASE(num_esl_ranks, num_rdma_ranks)                                                                               \
+    {                                                                                                                                  \
+    auto notify_dispatch_func = low_latency_mode ? notify_dispatch<true, num_esl_ranks, num_rdma_ranks> : notify_dispatch<false, num_esl_ranks, num_rdma_ranks>; \
+    LAUNCH_KERNEL(&cfg,                                                                                                            \
+        notify_dispatch_func,                                                                                            \
+        num_tokens_per_rank,                                                                                             \
+        moe_recv_counter_mapped,                                                                                         \
+        num_ranks,                                                                                                       \
+        num_tokens_per_rdma_rank,                                                                                        \
+        moe_recv_rdma_counter_mapped,                                                                                    \
+        num_tokens_per_expert,                                                                                           \
+        moe_recv_expert_counter_mapped,                                                                                  \
+        num_experts,                                                                                                     \
+        is_token_in_rank,                                                                                                \
+        num_tokens,                                                                                                      \
+        num_worst_tokens,                                                                                                \
+        num_channels,                                                                                                    \
+        expert_alignment,                                                                                                \
+        rdma_channel_prefix_matrix,                                                                                      \
+        recv_rdma_rank_prefix_sum,                                                                                       \
+        gbl_channel_prefix_matrix,                                                                                       \
+        recv_gbl_rank_prefix_sum,                                                                                        \
+        rdma_buffer_ptr,                                                                                                 \
+        buffer_ptrs,                                                                                                     \
+        rank,                                                                                                            \
+        num_nvl_ranks,                                                                                                   \
+        prims);                                                                                                          \
+    }
+
+    constexpr int kNumThreads = 8;
+    EP_HOST_ASSERT(num_nvl_ranks > 0 && num_nvl_ranks <= NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0);
+    const auto num_rdma_ranks = num_ranks / num_nvl_ranks;
+    // const auto num_rdma_experts = num_experts / num_rdma_ranks;
+    // const auto num_nvl_experts = num_rdma_experts / num_nvl_ranks;
+    EP_HOST_ASSERT(kNumThreads >= num_nvl_ranks);
+    EP_HOST_ASSERT(kNumThreads >= num_rdma_ranks);
+    // EP_HOST_ASSERT(num_nvl_experts <= NUM_MAX_NVL_EXPERTS);
+
+    // Validate num_channels
+    EP_HOST_ASSERT(num_channels > 0);
+    // EP_HOST_ASSERT(num_rdma_ranks >= num_channels && "num_rdma_ranks must be >= num_channels to avoid dst_rdma_rank out of bounds");
+
+    SETUP_LAUNCH_CONFIG(num_device_sms, max_threads_per_sm, kNumThreads, stream);
+
+    ESL_SWITCH(num_nvl_ranks, ESL_RANKS, [&] {
+      RDMA_SWITCH(num_rdma_ranks, RDMA_RANKS, [&] {
+        NOTIFY_DISPATCH_LAUNCH_CASE(ESL_RANKS, RDMA_RANKS);
+      });
+    });
+
+#undef NOTIFY_DISPATCH_LAUNCH_CASE
+}
+
+// 可以假定esl_rank_num=8,rdma_rank_num <=4
+// 缓冲区已被清零
+template <int esl_rank_num, int rdma_rank_num>
+__global__ __cooperative__ void dispatch(
+    // 8个输入数据
+    uint8_t *x,
+    uint8_t *is_token_in_rank,
+    int *topk_idx,
+    float *topk_weights,
+    int *rdma_channel_prefix_matrix,
+    int *global_channel_prefix_matrix,
+    int *recv_rdma_rank_prefix_sum,
+    int *recv_global_rank_prefix_sum,
+    // 8个输出数据
+    uint8_t *recv_x,
+    int *recv_topk_idx,
+    float *recv_topk_weights,
+    int *recv_src_meta,
+    int *recv_rdma_channel_prefix_matrix,
+    int *recv_global_channel_prefix_matrix,
+    int *send_rdma_head,
+    int *send_esl_head,
+    // 参数
+    int num_tokens,
+    int hidden_bytes,
+    int rank,
+    int num_topk,
+    int num_experts,
+    int num_max_rdma_chunked_recv_tokens,
+    int num_max_rdma_chunked_send_tokens,
+    int num_max_esl_chunked_recv_tokens,
+    int num_max_esl_chunked_send_tokens,
+    // 通信
+    uint8_t **buffer_ptrs,
+    int **barrier_signal_ptrs,
+    uint8_t *rdma_buffer_ptr,
+    struct primitives *prims) {
+    static constexpr uint64_t kDispatchTimeoutCycles = NUM_TIMEOUT_CYCLES;
+    // printf("num_max_rdma_chunked_send_tokens: %d\n", num_max_rdma_chunked_send_tokens);
+    // printf("num_max_rdma_chunked_recv_tokens: %d\n", num_max_rdma_chunked_recv_tokens);
+    // printf("num_max_esl_chunked_send_tokens: %d\n", num_max_esl_chunked_send_tokens);
+    // printf("num_max_esl_chunked_recv_tokens: %d\n", num_max_esl_chunked_recv_tokens);
+    constexpr int rank_num = rdma_rank_num * esl_rank_num;
+    int block_id = blockIdx.x;
+    int block_dim = blockDim.x, thread_id = threadIdx.x, sub_id = subThreadIdx.x;
+    int sip_id = block_id * block_dim + thread_id;
+    int sip_num = gridDim.x * blockDim.x;
+    int channel_id = sip_id / 2;
+    int channel_num = sip_num / 2;
+    num_max_esl_chunked_recv_tokens /= rdma_rank_num;
+    // int rdma_sender_subnum = 4;
+    // int rdma_esl_forwarder_subnum = 4;
+    // int esl_receiver_subnum = 8;
+
+    int is_rdma_sender = sip_id % 2 == 0 && sub_id < rdma_rank_num;
+    int is_rdma_esl_forwarder = sip_id % 2 == 0 && sub_id >= rdma_rank_num && sub_id < rdma_rank_num * 2;
+    int forwarder_id = sub_id - rdma_rank_num;
+    int is_esl_receiver = sip_id % 2 == 1 && sub_id < esl_rank_num;
+
+    // if (is_rdma_sender) {
+    //     is_rdma_sender = false;
+    //     is_esl_receiver = true;
+    // } else if (is_esl_receiver) {
+    //     if (sub_id < rdma_rank_num) {
+    //         is_esl_receiver = false;
+    //         is_rdma_sender = true;
+    //     }
+    // }
+    int rdma_rank = rank / esl_rank_num;
+    int esl_rank = rank % esl_rank_num;
+
+    uint8_t* nvl_buffers[esl_rank_num];
+    #pragma unroll
+    for (int i = 0; i < esl_rank_num; ++i) {
+        nvl_buffers[i] = buffer_ptrs[i] + NOTIFY_DISPATCH_OFFSET;
+    }
+    uint8_t* rdma_buffer_dispatch = reinterpret_cast<uint8_t*>(rdma_buffer_ptr) + NOTIFY_DISPATCH_OFFSET;
+
+    uint8_t* rdma_buffer_dispatch_clean = rdma_buffer_dispatch;
+    uint8_t* nvl_buffer_dispatch_clean = nvl_buffers[esl_rank];
+    
+
+    Prim<esl_rank_num, rdma_rank_num> prim;
+    Prim<esl_rank_num, rdma_rank_num, true> prim_s, *prim_shared = nullptr;
+
+    if (is_rdma_sender) {
+        int dst_rank = sub_id * esl_rank_num + esl_rank;
+        if (dst_rank != rank) {
+            prim.init_rdma(&prims[channel_id * 2], rank, dst_rank, channel_id * 2, rdma_buffer_ptr);
+        }
+    }
+    if (is_rdma_esl_forwarder) {
+        if (forwarder_id == 0) {
+            prim_s.init_esl(prims[channel_num + channel_id].primitive, rank, nvl_buffers);
+        }
+        int dst_rank = forwarder_id * esl_rank_num + esl_rank;
+        if (dst_rank != rank) {
+            prim.init_rdma(&prims[channel_id * 2 + 1], rank, dst_rank, channel_id * 2 + 1, rdma_buffer_ptr);
+        }
+    }
+    if (is_esl_receiver) {
+        prim.init_esl(prims[channel_id].primitive, rank, nvl_buffers);
+    }
+
+    __local__ __valigned__ long long stack_addr;
+
+    if (is_rdma_esl_forwarder && forwarder_id == 0) {
+        stack_addr = (long long)(&prim_s);
+        prim_shared = &prim_s;
+    }
+
+    __syncsubthreads();
+
+    if (is_rdma_esl_forwarder && forwarder_id > 0) {
+        prim_shared = (Prim<esl_rank_num, rdma_rank_num, true> *)*(volatile long long *)(&stack_addr);
+    }
+
+    uint8_t *buffer_ptr = nvl_buffers[esl_rank];
+
+    tops::private_dte dte;
+    dte.init();
+    tops::event event;
+    constexpr int tail_bytes = sizeof(int);
+    int num_bytes_per_token =
+        hidden_bytes + sizeof(int) * 2 + num_topk * sizeof(int) + num_topk * sizeof(float) + sizeof(int) * 2;
+
+    auto token_tail_ptr = [&](uint8_t *token_base)->volatile int * {
+        return reinterpret_cast<volatile int *>(token_base + num_bytes_per_token - sizeof(int));
+    };
+
+    // ------------------- SymBufferView 划分 -------------------
+    auto rdma_channel_meta = SymBufferView<int>(rdma_buffer_dispatch, esl_rank_num * 2 + 2, rdma_rank_num, channel_num, channel_id);
+    auto rdma_channel_data = SymBufferView<uint8_t>(rdma_buffer_dispatch, num_max_rdma_chunked_recv_tokens * num_bytes_per_token,
+                                                    rdma_rank_num, channel_num, channel_id);
+    auto rdma_channel_head = SymBufferView<int>(rdma_buffer_dispatch, 1, rdma_rank_num, channel_num, channel_id);
+    auto rdma_channel_barrier_buffer = SymBufferView<int>(rdma_buffer_dispatch, 1, rdma_rank_num, channel_num, channel_id);
+    auto esl_channel_prefix = SymBufferView<int>(buffer_ptr, rdma_rank_num * 2, esl_rank_num, channel_num, channel_id);
+    auto esl_channel_x = SymBufferView<uint8_t>(buffer_ptr, rdma_rank_num * num_max_esl_chunked_recv_tokens * num_bytes_per_token,
+                                                esl_rank_num, channel_num, channel_id);
+    auto esl_channel_head = SymBufferView<int>(buffer_ptr, rdma_rank_num, esl_rank_num, channel_num, channel_id);
+    auto esl_channel_tail = SymBufferView<int>(buffer_ptr, rdma_rank_num, esl_rank_num, channel_num, channel_id);
+    auto v_neg_one = (__vector int)-1;
+    int rdma_num_int_clean = (rdma_channel_meta.total_bytes +
+                              rdma_channel_data.total_bytes +
+                              rdma_channel_head.total_bytes +
+                              rdma_channel_barrier_buffer.total_bytes) / sizeof(int);
+    int esl_num_int_clean = (esl_channel_prefix.total_bytes +
+                             esl_channel_x.total_bytes + 
+                             esl_channel_head.total_bytes +
+                             esl_channel_tail.total_bytes) / sizeof(int);
+// #define CYCLE_PRINT
+#ifdef CYCLE_PRINT
+    long long rdma_wait_acc_cycles = 0;
+    long long esl_wait_acc_cycles = 0;
+#endif
+
+    // =====================================================================================
+    // RDMA sender
+    // =====================================================================================
+    if (is_rdma_sender) {
+        int dst_rdma_rank = sub_id;
+        int dst_rank = dst_rdma_rank * esl_rank_num + esl_rank;
+
+        // ------------------- 发送 meta -------------------
+        int *meta_send_buffer = (dst_rdma_rank != rdma_rank ? rdma_channel_meta.send_buffer(dst_rdma_rank)
+                                                            : rdma_channel_meta.recv_buffer(dst_rdma_rank));
+
+        __vector int channel_esl_start = (__vector int)0;
+        if (channel_id > 0) {
+            tcle::set_vl(esl_rank_num);
+            channel_esl_start = tcle::load_stride<__vector int>(
+                global_channel_prefix_matrix + dst_rdma_rank * esl_rank_num * channel_num + channel_id - 1, channel_num);
+            tcle::set_vl(512);
+        }
+        tcle::set_vl(esl_rank_num);
+        auto channel_esl_end = tcle::load_stride<__vector int>(
+            global_channel_prefix_matrix + dst_rdma_rank * esl_rank_num * channel_num + channel_id, channel_num);
+        tcle::set_vl(512);
+
+        __vector int channel_rdma_start;
+        if (channel_id == 0) {
+            channel_rdma_start[0] = 0;
+        } else {
+            tcle::set_vl(1);
+            channel_rdma_start =
+                tcle::load<__vector int>(rdma_channel_prefix_matrix + dst_rdma_rank * channel_num + channel_id - 1);
+            tcle::set_vl(512);
+        }
+        tcle::set_vl(1);
+        auto channel_rdma_end = tcle::load<__vector int>(rdma_channel_prefix_matrix + dst_rdma_rank * channel_num + channel_id);
+        tcle::set_vl(512);
+
+        // 编码
+        channel_esl_start = v_neg_one - channel_esl_start;
+        channel_esl_end = v_neg_one - channel_esl_end;
+        channel_rdma_start = v_neg_one - channel_rdma_start;
+        channel_rdma_end = v_neg_one - channel_rdma_end;
+
+        // 写L3
+        tcle::set_vl(esl_rank_num);
+        tcle::store(channel_esl_start, meta_send_buffer);
+        tcle::store(channel_esl_end, meta_send_buffer + esl_rank_num);
+        tcle::set_vl(512);
+        tcle::set_vl(1);
+        tcle::store(channel_rdma_start, meta_send_buffer + 2 * esl_rank_num);
+        tcle::store(channel_rdma_end, meta_send_buffer + 2 * esl_rank_num + 1);
+        tcle::set_vl(512);
+
+        // 发送rdma请求（meta）
+        if (dst_rdma_rank != rdma_rank) {
+            prim.send_rdma(rdma_channel_meta.recv_buffer(rdma_rank), meta_send_buffer, dst_rank, 2 * esl_rank_num + 2, false);
+            prim.ring_doorbell_rdma();
+        }
+
+        // ------------------- 发送 data（禁用跨 token 合并；采用“错位提交”） -------------------
+        uint8_t *data_send_buffer = (dst_rdma_rank == rdma_rank ? rdma_channel_data.recv_buffer(dst_rdma_rank)
+                                                                : rdma_channel_data.send_buffer(dst_rdma_rank));
+
+        int rdma_head_cached = 0, rdma_tail = 0;
+
+        int num_tokens_per_channel = (num_tokens + channel_num - 1) / channel_num;
+        int token_start_idx = num_tokens_per_channel * channel_id;
+        int token_end_idx = tcle::min(token_start_idx + num_tokens_per_channel, num_tokens);
+
+        // “错位提交”参数
+        const int data_bytes = num_bytes_per_token - tail_bytes;
+
+        // 段状态（只在 dst_rank != rank 时生效）
+        bool seg_active = false;
+        int prev_slot_idx = -1;
+        uint8_t *prev_send_token_base = nullptr;
+        uint8_t *prev_recv_token_base = nullptr;
+
+        int posted_since_last_ring = 0;
+        auto maybe_ring = [&](bool force) {
+            if (dst_rank == rank)
+                return;
+            if (posted_since_last_ring == 0)
+                return;
+            if (force || posted_since_last_ring >= 2) {
+                prim.ring_doorbell_rdma();
+                posted_since_last_ring = 0;
+            }
+        };
+
+        // bool need_wait_dte = false;
+        using rank_dt = typename RankType<esl_rank_num>::DT;
+        using rank_vt = typename RankType<esl_rank_num>::VT;
+        constexpr int  rank_vn = RankType<esl_rank_num>::N;
+        __valigned__ rank_dt rank_cache[rank_vn];
+        int resume_tokens = token_end_idx - token_start_idx;
+        int idx_in_vec = 0;
+        tcle::set_vl(tcle::min(resume_tokens, rank_vn));
+
+        tcle::store(
+            tcle::loadeoa<rank_vt>(is_token_in_rank + token_start_idx * rank_num + dst_rdma_rank * esl_rank_num,
+                                              rank_num / sizeof(rank_dt)),
+            rank_cache);
+
+        tcle::set_vl(512);
+        for (int token_idx = token_start_idx; token_idx < token_end_idx; token_idx++) {
+            // long long start = tops::clock64();
+            uint64_t is_token_in_rdma_rank = rank_cache[idx_in_vec];
+
+            idx_in_vec++;
+            resume_tokens--;
+            if (UNLIKELY(idx_in_vec == rank_vn)) {
+                if (LIKELY(resume_tokens > 0)) {
+                    tcle::set_vl(tcle::min(resume_tokens, rank_vn));
+                    tcle::store(tcle::loadeoa<rank_vt>(
+                                    is_token_in_rank + (token_idx + 1) * rank_num + dst_rdma_rank * esl_rank_num,
+                                    rank_num / sizeof(rank_dt)),
+                                rank_cache);
+                    tcle::set_vl(512);
+                    idx_in_vec = 0;
+                }
+            }
+
+            if (UNLIKELY(is_token_in_rdma_rank == 0ull)) {
+                send_rdma_head[token_idx * rdma_rank_num + dst_rdma_rank] = -1;
+                continue;
+            }
+
+            // ring 空间检查
+            uint64_t wait_rdma_ring_space_start = tops::clock64();
+            bool wait_rdma_ring_space_timed_out_printed = false;
+            while (UNLIKELY(rdma_tail - rdma_head_cached >= num_max_rdma_chunked_recv_tokens)) {
+                rdma_head_cached = *(volatile int *)rdma_channel_head.recv_buffer(dst_rdma_rank);
+                tcle::fence<0>();
+                if (!wait_rdma_ring_space_timed_out_printed &&
+                    (tops::clock64() - wait_rdma_ring_space_start > kDispatchTimeoutCycles)) {
+                    printf("[dispatch][timeup>20s][RDMA sender wait ring space] rank=%d rdma_rank=%d esl_rank=%d "
+                           "channel=%d token_idx=%d dst_rdma_rank=%d rdma_tail=%d rdma_head_cached=%d capacity=%d\n",
+                           rank, rdma_rank, esl_rank,
+                           channel_id, token_idx, dst_rdma_rank,
+                           rdma_tail, rdma_head_cached, num_max_rdma_chunked_recv_tokens);
+                    wait_rdma_ring_space_timed_out_printed = true;
+                }
+            }
+
+            send_rdma_head[token_idx * rdma_rank_num + dst_rdma_rank] = rdma_tail;
+            int slot_idx = rdma_tail % num_max_rdma_chunked_recv_tokens;
+            uint8_t *send_buffer_this_token = data_send_buffer + slot_idx * num_bytes_per_token;
+
+            // 1) x
+            uint8_t *x_this_token = x + token_idx * hidden_bytes;
+            dte.config_memcpy(tops::mdspan(tops::Global, send_buffer_this_token, hidden_bytes),
+                              tops::mdspan(tops::Global, x_this_token, hidden_bytes));
+            event = dte.trigger();
+
+            // 2) src_rdma_rank + padding(int)
+            tcle::set_vl(1);
+            __vector int v_rdma_rank = tcle::load<__vector int>((int *)(send_buffer_this_token + hidden_bytes));
+            tcle::set_vl(512);
+            // 3) topk_idx
+            tcle::set_vl(num_topk);
+            auto v_topk_idx = tcle::load<__vector int>(topk_idx + token_idx * num_topk);
+            // 4) topk_weights
+            auto v_topk_weights = tcle::load<__vector float>(topk_weights + token_idx * num_topk);
+            tcle::set_vl(512);
+
+            // 2) src_rdma_rank + padding(int)
+            uint8_t *p = send_buffer_this_token + hidden_bytes;
+            tcle::set_vl(1);
+            tcle::store(v_rdma_rank, p);
+            tcle::set_vl(512);
+            p += 2 * sizeof(int);
+            // 3) topk_idx
+            tcle::set_vl(num_topk);
+            tcle::store(v_topk_idx, (int *)p);
+            p += num_topk * sizeof(int);
+            // 4) topk_weights
+            tcle::store(v_topk_weights, (float *)p);
+            tcle::set_vl(512);
+            p += num_topk * sizeof(float);
+            // 5) bits（写到尾部字段）
+            bool *p_bool = (bool *)&is_token_in_rdma_rank;
+            int is_token_in_esl_rank_bits = 0;
+#pragma clang loop unroll(full)
+            for (int i = 0; i < esl_rank_num; i++) {
+                is_token_in_esl_rank_bits |= (int)p_bool[i] << i;
+            }
+            *(volatile int *)p = is_token_in_esl_rank_bits;
+            p += sizeof(int);
+            // 6) tail_stamp（本地最后写）：期望值 = 当前 token 序号 + 1
+            if (dst_rank == rank) {
+                event.wait();
+                tcle::fence<L3_MEM_STORE>();
+            }
+            *(volatile int *)p = rdma_tail + 1;
+            // 等待 DTE 把 x 写完（后续 RDMA payload 可能包含当前 token data）
+
+            // 生成 RDMA 目标地址（对端对称 recv buffer）
+            uint8_t *recv_buffer_this_token = rdma_channel_data.recv_buffer(rdma_rank) + slot_idx * num_bytes_per_token;
+
+            // dst_rank == rank：本地写入 recv buffer 即可，tail 已直接可见，不需要“错位提交”
+            if (dst_rank == rank) {
+                rdma_tail++;
+                continue;
+            }
+
+            // ------------------ “错位提交”发送策略 ------------------
+            // 规则：
+            //   段首：发 data-only（不带 tail）
+            //   段内：发 [prev_tail | curr_data(excl tail)]，长度 = tail_bytes + data_bytes = num_bytes_per_token
+            //   段末：补发 last_tail-only，长度 = tail_bytes
+            //
+            // 段的边界：slot 不连续（包括 wrap）就切段。
+
+            bool contiguous = seg_active && (slot_idx == prev_slot_idx + 1);
+            bool start_new_segment = (!seg_active) || (!contiguous);
+
+            // 若要切段，先提交上一个段的最后一个 token（补 tail-only）
+            if (seg_active && start_new_segment) {
+                uint8_t *tail_src = prev_send_token_base + data_bytes; // tail region start
+                uint8_t *tail_dst = prev_recv_token_base + data_bytes;
+
+                // 确保 tail store 对 NIC 可见
+                tcle::fence<L3_MEM_STORE>();
+                prim.send_rdma(tail_dst, tail_src, dst_rank, tail_bytes, false);
+                posted_since_last_ring++;
+                maybe_ring(false);
+            }
+
+            if (start_new_segment) {
+                // 段首：发当前 token 的 data-only（不含 tail）
+                prim.send_rdma(recv_buffer_this_token, send_buffer_this_token, dst_rank, data_bytes, false);
+                posted_since_last_ring++;
+                seg_active = true;
+            } else {
+                // 段内：发 [prev_tail | curr_data(excl tail)]，从 prev_tail 起始，长度 = num_bytes_per_token
+                uint8_t *mis_src = prev_send_token_base + data_bytes; // prev tail
+                uint8_t *mis_dst = prev_recv_token_base + data_bytes; // prev tail on remote
+
+                prim.send_rdma(mis_dst, mis_src, dst_rank, tail_bytes + data_bytes, false); // == num_bytes_per_token
+                posted_since_last_ring++;
+            }
+
+            // 更新段状态（last token）
+            prev_slot_idx = slot_idx;
+            prev_send_token_base = send_buffer_this_token;
+            prev_recv_token_base = recv_buffer_this_token;
+
+            // 适度 ring，避免长时间不 doorbell
+            event.wait();
+            maybe_ring(false);
+
+            rdma_tail++;
+            // printf("clock = %llu\n", tops::clock64() - start);
+        }
+
+        // 段末补一个 tail-only，提交最后一个 token
+        if (dst_rank != rank && seg_active) {
+            uint8_t *tail_src = prev_send_token_base + data_bytes;
+            uint8_t *tail_dst = prev_recv_token_base + data_bytes;
+            tcle::fence<L3_MEM_STORE>();
+            prim.send_rdma(tail_dst, tail_src, dst_rank, tail_bytes, false, true);
+            posted_since_last_ring++;
+        }
+
+        // 强制 ring 一次，保证尾部 WQE 都可见
+        maybe_ring(true);
+    }
+
+    // =====================================================================================
+    // RDMA->ESL forwarder
+    // =====================================================================================
+    else if (is_rdma_esl_forwarder) {
+        int src_rdma_rank = forwarder_id;
+        int base_slot = src_rdma_rank * num_max_esl_chunked_recv_tokens;
+        tops::local_dte local_dte[rdma_rank_num];
+        local_dte[forwarder_id].init();
+        tops::event local_event;
+        // long long acc_config_cycles = 0;
+
+        // 接收 meta，然后转发 ESL meta
+        volatile int *meta_recv_buffer = (int *)rdma_channel_meta.recv_buffer(src_rdma_rank);
+        int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
+        for (int dst_esl_rank = 0; dst_esl_rank < esl_rank_num; dst_esl_rank++) {
+            int meta_0, meta_1, meta_2, meta_3;
+            uint64_t wait_meta_start = tops::clock64();
+            bool wait_meta_timed_out_printed = false;
+            while (true) {
+                meta_0 = meta_recv_buffer[dst_esl_rank];
+                meta_1 = meta_recv_buffer[esl_rank_num + dst_esl_rank];
+                meta_2 = meta_recv_buffer[2 * esl_rank_num];
+                meta_3 = meta_recv_buffer[2 * esl_rank_num + 1];
+                if (meta_0 < 0 && meta_1 < 0 && meta_2 < 0 && meta_3 < 0) {
+                    break;
+                }
+                if (!wait_meta_timed_out_printed &&
+                    (tops::clock64() - wait_meta_start > kDispatchTimeoutCycles)) {
+                    printf("[dispatch][timeup>20s][Forwarder wait meta] rank=%d rdma_rank=%d esl_rank=%d channel=%d "
+                           "src_rdma_rank=%d dst_esl_rank=%d meta0=%d meta1=%d meta2=%d meta3=%d\n",
+                           rank, rdma_rank, esl_rank, channel_id,
+                           src_rdma_rank, dst_esl_rank,
+                           meta_0, meta_1, meta_2, meta_3);
+                    wait_meta_timed_out_printed = true;
+                }
+            }
+
+            int *prefix_send_buffer = (dst_esl_rank != esl_rank ? esl_channel_prefix.send_buffer(dst_esl_rank)
+                                                                : esl_channel_prefix.recv_buffer(esl_rank)) +
+                                      src_rdma_rank * 2;
+            int channel_esl_start = -meta_0 - 1;
+            int channel_esl_end = -meta_1 - 1;
+            prefix_send_buffer[0] = -channel_esl_start - 1;
+            prefix_send_buffer[1] = -channel_esl_end - 1;
+
+            int *recv_buffer = esl_channel_prefix.recv_buffer(esl_rank) + src_rdma_rank * 2;
+            int dst_rank = rdma_rank * esl_rank_num + dst_esl_rank;
+            if (dst_esl_rank != esl_rank) {
+                prim_shared->send_esl_and_ring(recv_buffer, prefix_send_buffer, dst_rank, 2, forwarder_id);
+            }
+
+            if (dst_esl_rank == 0) {
+                int channel_rdma_start = -meta_2 - 1;
+                int channel_rdma_end = -meta_3 - 1;
+                num_tokens_to_recv_from_rdma = channel_rdma_end - channel_rdma_start;
+                recv_rdma_channel_prefix_matrix[src_rdma_rank * channel_num + channel_id] = channel_rdma_end;
+                src_rdma_channel_prefix =
+                    (src_rdma_rank == 0 ? 0 : recv_rdma_rank_prefix_sum[src_rdma_rank - 1]) + channel_rdma_start;
+            }
+        }
+
+        constexpr int kEslSendBatch = 16; // 每个 dst_esl_rank 聚合的 token 数
+        int send_batch = num_tokens <= 1024 ? 8 : kEslSendBatch;
+        const int data_bytes = num_bytes_per_token - tail_bytes; // data 部分，不包含 tail_stamp(int)
+
+        // 每个 dst_esl_rank 的待发送队列（仅针对 dst_esl_rank != esl_rank 的跨卡发送）
+        int pending_cnt[esl_rank_num] = {0};
+        uint8_t *pending_src[esl_rank_num][kEslSendBatch]; // data src：零拷贝指向 RDMA token
+        uint8_t *pending_dst[esl_rank_num][kEslSendBatch]; // data dst：对端对称 recv slot（未加 buffer_offset）
+        int *pending_src_flag[esl_rank_num][kEslSendBatch]; // flag src：本地 staging（global 可读）
+
+        // 本地 dst_esl_rank == esl_rank：仅做 tail 写入 batching（保持与原结构一致）
+        int *pending_addr[kEslSendBatch];
+        int pending_value[kEslSendBatch];
+        int dte_cnt = 0;
+
+        __valigned__ roce_wqe data_wqe;
+        data_wqe.init(0, 0, 0, (void *)0, (void *)0, 0);
+
+        auto flush_dst = [&](int dst_esl_rank) {
+            // 等待本 token 的所有 DTE 完成
+            if (dte_cnt > 0) {
+                if (dte_cnt > 1) {
+                    event.wait();
+                    local_event.wait();
+                } else {
+                    event.wait();
+                }
+                dte_cnt = 0;
+            }
+            int cnt = pending_cnt[dst_esl_rank];
+            if (cnt == 0)
+                return;
+            if (dst_esl_rank == esl_rank) { // 本地 rank 不走 ESL
+                tcle::fence<0>();
+                for (int i = 0; i < cnt; ++i) {
+                    int *addr = pending_addr[i];
+                    int value = pending_value[i];
+                    *addr = value;
+                }
+                pending_cnt[dst_esl_rank] = 0;
+                return;
+            }
+
+            // dst_rank：同一个 rdma_rank 组内的目标 esl rank
+            // int dst_rank = rdma_rank * esl_rank_num + dst_esl_rank;
+
+            // 1) lock 一次
+            prim_shared->esl_lock_[dst_esl_rank].lock(forwarder_id);
+
+            // 2) SQ 空间检查（每 token 需要 2 个 WQE：data + flag）
+            int need_wqes = 2 * cnt;
+            if (prim_shared->unfinished_[dst_esl_rank] + need_wqes > MAX_ROCE_SQELEM_NUM) {
+                prim_shared->esl_engines_[dst_esl_rank].waitTransDone();
+                prim_shared->unfinished_[dst_esl_rank] = 0;
+            }
+            prim_shared->unfinished_[dst_esl_rank] += need_wqes;
+
+            // 3) 连续 post 多个 token 的 (data + flag) WQE
+            // long long start = tops::clock64();
+            data_wqe.set_msi_addr_data(prim_shared->esl_engines_[dst_esl_rank].lare_dev_info_.port_id,
+                                       prim_shared->esl_engines_[dst_esl_rank].lare_dev_info_.qp_id);
+            tcle::set_vl(8);
+#pragma unroll 1
+            for (int i = 0; i < cnt; ++i) {
+                uint8_t *src_token_base = pending_src[dst_esl_rank][i]; // RDMA token base（零拷贝）
+                uint8_t *dst_token_base = pending_dst[dst_esl_rank][i]; // 对端对称 recv slot（未加 offset）
+
+                // dst 要加 buffer_offset_
+                uint8_t *dst = (uint8_t *)dst_token_base + prim_shared->buffer_offset_[dst_esl_rank];
+                uint8_t *src = (uint8_t *)src_token_base;
+
+                // dst_flag 必须与 dst 同一地址体系（都在 +buffer_offset 后）
+                int *dst_flag = (int *)(dst + data_bytes);
+
+                // src_flag：本地 staging（global 可见）
+                int *src_flag = pending_src_flag[dst_esl_rank][i];
+
+                prim_shared->esl_engines_[dst_esl_rank].template prep_trans_data_flag<NON_ATOMIC_OPERATION, uint8_t, int>(
+                    dst, src, (size_t)data_bytes, dst_flag, src_flag, data_wqe);
+            }
+            tcle::set_vl(512);
+            // acc_config_cycles += tops::clock64() - start;
+
+            // 4) doorbell：一次 ringDb 推出整批
+            tcle::fence<L3_MEM_STORE>();
+            prim_shared->esl_engines_[dst_esl_rank].ringDb();
+
+            // 5) unlock
+            tcle::fence<L1_SDMEM_STORE>();
+            prim_shared->esl_lock_[dst_esl_rank].unlock(forwarder_id);
+
+            pending_cnt[dst_esl_rank] = 0;
+        };
+
+        auto flush_all = [&]() {
+            for (int dst_esl_rank = 0; dst_esl_rank < esl_rank_num; ++dst_esl_rank) {
+                if (pending_cnt[dst_esl_rank] > 0) {
+                    flush_dst(dst_esl_rank);
+                }
+            }
+        };
+
+        // 零拷贝安全：更新 rdma_head 前，必须确保 ESL 侧不再引用 RDMA ring 的 src（waitTransDone）
+        auto drain_all_esl_engines = [&]() {
+            for (int dst_esl_rank = 0; dst_esl_rank < esl_rank_num; ++dst_esl_rank) {
+                if (dst_esl_rank == esl_rank)
+                    continue;
+                if (prim_shared->unfinished_[dst_esl_rank] == 0)
+                    continue;
+
+                prim_shared->esl_lock_[dst_esl_rank].lock(forwarder_id);
+                prim_shared->esl_engines_[dst_esl_rank].waitTransDone();
+                prim_shared->unfinished_[dst_esl_rank] = 0;
+                tcle::fence<L1_SDMEM_STORE>();
+                prim_shared->esl_lock_[dst_esl_rank].unlock(forwarder_id);
+            }
+        };
+
+        // ------------------------------------------------------------
+        // 转发 data（零拷贝）
+        // ------------------------------------------------------------
+        volatile int rdma_head = 0;
+        volatile int esl_head_cached[esl_rank_num] = {0}, esl_tail[esl_rank_num] = {0}, esl_cnt[esl_rank_num] = {0};
+        uint8_t *rdma_recv_buffer = rdma_channel_data.recv_buffer(src_rdma_rank);
+        int consume_tokens = 0;
+        int cached_tail_num = 0;
+        int cached_tail_offset = 0;
+        __valigned__ long long tail_cache[64];
+
+        while (num_tokens_to_recv_from_rdma > 0) {
+            int rdma_slot_idx = rdma_head % num_max_rdma_chunked_recv_tokens;
+            uint8_t *x_this_token = rdma_recv_buffer + rdma_slot_idx * num_bytes_per_token;
+
+            // 先等该 token 的 tail_stamp == rdma_head+1，确保 token 已提交
+            volatile long long *p_tail_and_bits = (volatile long long *)(x_this_token + num_bytes_per_token - sizeof(long long));
+            uint32_t expected = static_cast<uint32_t>(rdma_head + 1);
+            auto fill_cache = [&]() {
+                int tail_num = tcle::min(num_max_rdma_chunked_recv_tokens - rdma_slot_idx, 4);
+                tcle::set_vl(tail_num);
+                tcle::store(tcle::loadeoa<__vector long long>((char *)p_tail_and_bits, (long long)num_bytes_per_token),
+                            tail_cache);
+                tcle::set_vl(512);
+                cached_tail_num = tail_num;
+                cached_tail_offset = 0;
+            };
+            if (cached_tail_num == 0) {
+                fill_cache();
+            }
+
+            long long tail_and_bits = tail_cache[cached_tail_offset];
+#ifdef CYCLE_PRINT
+            long long start = tops::clock64();
+#endif
+            uint64_t wait_tail_stamp_start = tops::clock64();
+            bool wait_tail_stamp_timed_out_printed = false;
+            while (static_cast<uint32_t>(tail_and_bits >> 32) != expected) {
+                if (!wait_tail_stamp_timed_out_printed &&
+                    (tops::clock64() - wait_tail_stamp_start > kDispatchTimeoutCycles)) {
+                    const uint32_t observed = static_cast<uint32_t>(tail_and_bits >> 32);
+                    printf("[dispatch][timeup>20s][Forwarder wait tail_stamp] rank=%d rdma_rank=%d esl_rank=%d channel=%d "
+                           "src_rdma_rank=%d rdma_head=%d slot=%d expected=%u observed=%u cached_tail_num=%d cached_tail_off=%d\n",
+                           rank, rdma_rank, esl_rank, channel_id,
+                           src_rdma_rank, static_cast<int>(rdma_head), rdma_slot_idx,
+                           expected, observed, cached_tail_num, cached_tail_offset);
+                    wait_tail_stamp_timed_out_printed = true;
+                }
+                fill_cache();
+                tail_and_bits = tail_cache[cached_tail_offset];
+            }
+#ifdef CYCLE_PRINT
+            rdma_wait_acc_cycles += tops::clock64() - start;
+#endif
+            cached_tail_offset++;
+            cached_tail_num--;
+            if (cached_tail_num == 0) {
+                fill_cache();
+            }
+
+            int is_token_in_esl_rank_bits = static_cast<uint32_t>(tail_and_bits);
+
+            for (int dst_esl_rank = 0; dst_esl_rank < esl_rank_num; dst_esl_rank++) {
+                int is_in_dst = (is_token_in_esl_rank_bits >> dst_esl_rank) & 1;
+                send_esl_head[(src_rdma_channel_prefix + rdma_head) * NUM_MAX_NVL_PEERS + dst_esl_rank] =
+                    is_in_dst ? esl_cnt[dst_esl_rank] : -1;
+                esl_cnt[dst_esl_rank] += is_in_dst;
+
+                if (!is_in_dst)
+                    continue;
+
+                volatile int *esl_head_buffer = (volatile int *)esl_channel_head.recv_buffer(dst_esl_rank);
+                uint64_t wait_esl_ring_space_start = tops::clock64();
+                bool wait_esl_ring_space_timed_out_printed = false;
+                while (esl_tail[dst_esl_rank] - esl_head_cached[dst_esl_rank] >= num_max_esl_chunked_recv_tokens) {
+                    esl_head_cached[dst_esl_rank] = esl_head_buffer[src_rdma_rank];
+                    if (!wait_esl_ring_space_timed_out_printed &&
+                        (tops::clock64() - wait_esl_ring_space_start > kDispatchTimeoutCycles)) {
+                        printf("[dispatch][timeup>20s][Forwarder wait esl ring space] rank=%d rdma_rank=%d esl_rank=%d channel=%d "
+                               "src_rdma_rank=%d dst_esl_rank=%d esl_tail=%d esl_head_cached=%d esl_head_now=%d capacity=%d\n",
+                               rank, rdma_rank, esl_rank, channel_id,
+                               src_rdma_rank, dst_esl_rank,
+                               esl_tail[dst_esl_rank], esl_head_cached[dst_esl_rank],
+                               static_cast<int>(esl_head_buffer[src_rdma_rank]), num_max_esl_chunked_recv_tokens);
+                        wait_esl_ring_space_timed_out_printed = true;
+                    }
+                }
+
+                int slot_offset = (base_slot + esl_tail[dst_esl_rank] % num_max_esl_chunked_recv_tokens) * num_bytes_per_token;
+
+                if (dst_esl_rank == esl_rank) {
+                    // 本地目标：仍需搬运到本地 recv ring
+                    uint8_t *x_local_recv = esl_channel_x.recv_buffer(esl_rank) + slot_offset;
+
+                    // DTE pipeline，两路交替（保持原结构）
+                    if (dte_cnt >= 2) {
+                        if (dte_cnt % 2 == 0)
+                            event.wait();
+                        else
+                            local_event.wait();
+                    }
+
+                    if (dte_cnt % 2 == 0) {
+                        dte.config_memcpy(tops::mdspan(tops::Global, x_local_recv, data_bytes),
+                                          tops::mdspan(tops::Global, x_this_token, data_bytes));
+                        event = dte.trigger();
+                    } else {
+                        local_dte[forwarder_id].config_memcpy(tops::mdspan(tops::Global, x_local_recv, data_bytes),
+                                                              tops::mdspan(tops::Global, x_this_token, data_bytes));
+                        local_event = local_dte[forwarder_id].trigger();
+                    }
+                    dte_cnt++;
+
+                    // tail batching（与原结构一致）
+                    int &pc = pending_cnt[dst_esl_rank];
+                    pending_addr[pc] = (int *)token_tail_ptr(x_local_recv);
+                    pending_value[pc] = esl_tail[dst_esl_rank] + 1;
+                    pc++;
+                    if (pc >= send_batch) {
+                        flush_dst(dst_esl_rank);
+                    }
+                } else {
+                    // 跨卡目标：data 零拷贝（src=RDMA recv token），flag 用 staging
+                    uint8_t *dst_token_base = esl_channel_x.recv_buffer(esl_rank) + slot_offset;
+
+                    // src_flag staging 放在本地 send buffer 的 tail 区（global 可见）
+                    uint8_t *staging_token_base = esl_channel_x.send_buffer(dst_esl_rank) + slot_offset;
+                    int *src_flag = (int *)(staging_token_base + data_bytes);
+                    *src_flag = esl_tail[dst_esl_rank] + 1;
+
+                    int &pc = pending_cnt[dst_esl_rank];
+                    pending_src[dst_esl_rank][pc] = x_this_token; // RDMA token base
+                    pending_dst[dst_esl_rank][pc] = dst_token_base; // 对端对称 recv slot base（未加 offset）
+                    pending_src_flag[dst_esl_rank][pc] = src_flag; // flag staging
+                    pc++;
+
+                    if (pc >= send_batch) {
+                        flush_dst(dst_esl_rank);
+                    }
+                }
+
+                esl_tail[dst_esl_rank]++; // 消耗一个 slot
+            }
+
+            rdma_head++;
+            num_tokens_to_recv_from_rdma--;
+            consume_tokens++;
+
+            // 更新 rdma head：必须先 flush + drain，确保零拷贝安全
+            if (consume_tokens >= num_max_rdma_chunked_recv_tokens / 2 || num_tokens_to_recv_from_rdma == 0) {
+                // 先把所有 batch 推出并等待完成，防止 rdma slot 被过早复用覆盖
+                flush_all();
+                drain_all_esl_engines();
+
+                int *head_send_buffer = src_rdma_rank != rdma_rank ? rdma_channel_head.send_buffer(src_rdma_rank)
+                                                                   : rdma_channel_head.recv_buffer(rdma_rank);
+                *(volatile int *)head_send_buffer = rdma_head;
+                // tcle::fence<L3_MEM_STORE>();
+                if (src_rdma_rank != rdma_rank) {
+                    int *head_recv_buffer = rdma_channel_head.recv_buffer(rdma_rank);
+                    int dst_rank = src_rdma_rank * esl_rank_num + esl_rank;
+                    prim.send_rdma(head_recv_buffer, head_send_buffer, dst_rank, 1, true, true);
+                    prim.ring_doorbell_rdma();
+                }
+                consume_tokens = 0;
+            }
+        }
+
+        // 循环结束前，flush 掉所有未满 batch 的队列，并 drain，避免 rdma_head 更新后仍引用旧 slot
+        flush_all();
+        drain_all_esl_engines();
+
+        local_dte[forwarder_id].destroy();
+        // printf("acc_config_cycles = %llu\n", acc_config_cycles);
+#ifdef CYCLE_PRINT
+        printf("rdma_wait_acc_cycles = %llu\n", rdma_wait_acc_cycles);
+#endif
+    }
+
+    // ===================================================================================
+    // ESL receiver
+    // ===================================================================================
+    else if (is_esl_receiver) {
+        int src_esl_rank = sub_id;
+        volatile int *meta_recv_buffer = esl_channel_prefix.recv_buffer(src_esl_rank);
+        // volatile int *tail_recv_buffer = esl_channel_tail.recv_buffer(src_esl_rank);
+        uint8_t *x_recv_buffer = esl_channel_x.recv_buffer(src_esl_rank);
+        int expert_per_rank = num_experts / rank_num;
+        int expert_start = expert_per_rank * rank;
+        int expert_end = expert_start + expert_per_rank;
+
+        struct RecvCtx {
+            int meta_ready;
+            int channel_esl_start;
+            int channel_esl_end;
+            int recv_offset;
+            int remaining;
+
+            int esl_head;
+            int esl_tail_cached;
+
+            int src_rdma_rank;
+            int base_slot;
+            int last_sent_head;
+        };
+
+        RecvCtx ctx[rdma_rank_num];
+
+#pragma clang loop unroll(full)
+        for (int r = 0; r < rdma_rank_num; ++r) {
+            ctx[r].meta_ready = 0;
+            ctx[r].channel_esl_start = 0;
+            ctx[r].channel_esl_end = 0;
+            ctx[r].recv_offset = 0;
+            ctx[r].remaining = 0;
+            ctx[r].esl_head = 0;
+            ctx[r].esl_tail_cached = 0;
+            ctx[r].src_rdma_rank = r;
+            ctx[r].base_slot = r * num_max_esl_chunked_recv_tokens;
+            ctx[r].last_sent_head = 0;
+        }
+
+        constexpr int num_max_coroutine_recv_tokens = 4;
+
+        int done_cnt = 0;
+        int repeat = 0;
+#ifdef CYCLE_PRINT
+        long long start = tops::clock64();
+#endif
+        constexpr int kHeadUpdateBatch = 32;
+        uint64_t wait_receiver_progress_start = tops::clock64();
+        bool wait_receiver_progress_timed_out_printed = false;
+        while (done_cnt < rdma_rank_num) {
+            if (!wait_receiver_progress_timed_out_printed &&
+                (tops::clock64() - wait_receiver_progress_start > kDispatchTimeoutCycles)) {
+                int stuck_r = -1;
+                for (int r = 0; r < rdma_rank_num; ++r) {
+                    if (!(ctx[r].meta_ready && ctx[r].remaining == 0)) {
+                        stuck_r = r;
+                        break;
+                    }
+                }
+                if (stuck_r < 0) stuck_r = 0;
+                auto &c = ctx[stuck_r];
+                printf("[dispatch][timeup>20s][ESL receiver progress] rank=%d rdma_rank=%d esl_rank=%d channel=%d "
+                       "done_cnt=%d/%d repeat=%d stuck_r=%d meta_ready=%d remaining=%d esl_head=%d esl_tail_cached=%d\n",
+                       rank, rdma_rank, esl_rank, channel_id,
+                       done_cnt, rdma_rank_num, repeat, stuck_r,
+                       c.meta_ready, c.remaining, c.esl_head, c.esl_tail_cached);
+                wait_receiver_progress_timed_out_printed = true;
+            }
+            for (int r = 0; r < rdma_rank_num; ++r) {
+                auto &c = ctx[r];
+
+                if (c.meta_ready && c.remaining == 0) {
+                    continue;
+                }
+
+                if (!c.meta_ready) {
+                    int meta_0 = meta_recv_buffer[c.src_rdma_rank * 2 + 0];
+                    int meta_1 = meta_recv_buffer[c.src_rdma_rank * 2 + 1];
+
+                    if (!(meta_0 < 0 && meta_1 < 0)) {
+                        continue;
+                    }
+
+                    c.channel_esl_start = -meta_0 - 1;
+                    c.channel_esl_end = -meta_1 - 1;
+
+                    int src_rank = c.src_rdma_rank * esl_rank_num + src_esl_rank;
+                    int src_rank_offset = (src_rank == 0) ? 0 : recv_global_rank_prefix_sum[src_rank - 1];
+
+                    c.recv_offset = src_rank_offset + c.channel_esl_start;
+                    c.remaining = c.channel_esl_end - c.channel_esl_start;
+
+                    recv_global_channel_prefix_matrix[src_rank * channel_num + channel_id] = c.recv_offset;
+
+                    c.meta_ready = 1;
+
+                    if (c.remaining == 0) {
+                        done_cnt++;
+                    }
+
+                    continue;
+                }
+
+                if (c.remaining <= 0) {
+                    continue;
+                }
+
+                int first_slot_offset = (c.base_slot + (c.esl_head % num_max_esl_chunked_recv_tokens)) * num_bytes_per_token;
+                uint8_t *first_token_ptr = x_recv_buffer + first_slot_offset;
+                int expected_first = c.esl_head + 1;
+                int tail_first = *(volatile int *)token_tail_ptr(first_token_ptr);
+                if (tail_first != expected_first) {
+                    repeat++;
+                    continue;
+                }
+                repeat = 0;
+
+                int batch = tcle::min(c.remaining, num_max_coroutine_recv_tokens);
+#ifdef CYCLE_PRINT
+                esl_wait_acc_cycles += tops::clock64() - start;
+#endif
+
+                for (int i = 0; i < batch; i++) {
+                    int slot_offset = (c.base_slot + (c.esl_head % num_max_esl_chunked_recv_tokens)) * num_bytes_per_token;
+                    uint8_t *token_ptr = x_recv_buffer + slot_offset;
+
+                    int expected = c.esl_head + 1;
+                    int tailv = *(volatile int *)token_tail_ptr(token_ptr);
+                    if (tailv != expected) {
+                        break;
+                    }
+
+                    // x
+                    uint8_t *x_output = recv_x + c.recv_offset * hidden_bytes;
+                    dte.config_memcpy(tops::mdspan(tops::Global, x_output, hidden_bytes),
+                                      tops::mdspan(tops::Global, token_ptr, hidden_bytes));
+                    event = dte.trigger();
+                    token_ptr += hidden_bytes;
+
+                    // src meta (layout: int src_rdma_rank + padding int)
+                    int src_rdma_rank_this_token = *(int *)token_ptr;
+                    token_ptr += 2 * sizeof(int);
+
+                    // topk_idx
+                    tcle::set_vl(num_topk);
+                    auto v_topk_idx = tcle::load<__vector int>((int *)token_ptr);
+                    __vector bool int valid_idx =
+                        (v_topk_idx >= (__vector int)expert_start) && (v_topk_idx < (__vector int)expert_end);
+                    v_topk_idx = tcle::vsel(valid_idx, v_topk_idx % expert_per_rank, (__vector int)-1);
+                    tcle::store(v_topk_idx, recv_topk_idx + c.recv_offset * num_topk);
+                    token_ptr += num_topk * sizeof(int);
+
+                    // topk_weights
+                    auto v_topk_weights = tcle::load<__vector float>((float *)token_ptr);
+                    v_topk_weights = tcle::vsel(valid_idx, v_topk_weights, (__vector float)0.0f);
+                    // if (v_topk_weights[0] >= 16 || v_topk_weights[0] < 0)
+                    //     printf("v_topk_weights[0] = %f\n", v_topk_weights[0]);
+                    tcle::store(v_topk_weights, recv_topk_weights + c.recv_offset * num_topk);
+                    token_ptr += num_topk * sizeof(float);
+                    // tcle::fence<0>();
+                    tcle::set_vl(512);
+
+                    // bits
+                    int is_token_in_esl_rank_bits = *(int *)token_ptr;
+                    recv_src_meta[2 * c.recv_offset] = src_rdma_rank_this_token;
+                    recv_src_meta[2 * c.recv_offset + 1] = is_token_in_esl_rank_bits;
+
+                    event.wait();
+
+                    c.recv_offset++;
+                    c.esl_head++;
+                    c.remaining--;
+                    if (c.remaining == 0) {
+                        break;
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // head batching：累计推进到 N 才回写（或 remaining==0 强制回写）
+                // ------------------------------------------------------------
+                bool need_update_head = false;
+
+                // 1) 达到 batching 阈值
+                if (c.esl_head - c.last_sent_head >= kHeadUpdateBatch) {
+                    need_update_head = true;
+                }
+
+                // 2) 本 rank 已完成（remaining==0）必须把最终 head 回写出去
+                if (c.remaining == 0 && c.esl_head != c.last_sent_head) {
+                    need_update_head = true;
+                }
+
+                // 3) 额外安全阀：避免 forwarder 因环满等待太久
+                //    当 receiver 已推进很多但还没回写时，强制回写（这里用半环作为安全阈值）
+                if (c.esl_head - c.last_sent_head >= (num_max_esl_chunked_recv_tokens / 2)) {
+                    need_update_head = true;
+                }
+
+                if (need_update_head) {
+                    int *head_send_buffer = (src_esl_rank != esl_rank ? esl_channel_head.send_buffer(src_esl_rank)
+                                                                      : esl_channel_head.recv_buffer(esl_rank)) +
+                                            c.src_rdma_rank;
+
+                    // 本地 rank 写 head（release 可见性）
+                    if (src_esl_rank == esl_rank) {
+                        tcle::fence<0>();
+                    }
+                    *(volatile int *)head_send_buffer = c.esl_head;
+
+                    // 跨卡：发送 head 给对端 forwarder（释放对端 ESL ring）
+                    if (src_esl_rank != esl_rank) {
+                        int *head_recv_buffer = esl_channel_head.recv_buffer(esl_rank) + c.src_rdma_rank;
+                        int dst_rank = rdma_rank * esl_rank_num + src_esl_rank;
+
+                        prim.send_esl(head_recv_buffer, head_send_buffer, dst_rank, 1);
+                        prim.ring_doorbell(dst_rank);
+                        prim.wait_esl_trans_done(dst_rank);
+                    }
+
+                    c.last_sent_head = c.esl_head;
+                }
+
+                if (c.remaining == 0) {
+                    done_cnt++;
+                }
+#ifdef CYCLE_PRINT
+                start = tops::clock64();
+#endif
+            }
+        }
+#ifdef CYCLE_PRINT
+        printf("esl_wait_acc_cycles = %llu\n", esl_wait_acc_cycles);
+#endif
+    }
+    (void)prim_s;
+    // barrier all cars
+    tops::sync_grid_threads();
+    // ------------------------------------------------------------
+    // After ESL receiver finishes: broadcast a special flag to other
+    // intra-node cards via `barrier_signal_ptrs`.
+    //
+    // Use `barrier_signal_ptrs[esl_rank][esl_rank]` as local staging,
+    // and send it to `barrier_signal_ptrs[dst_esl_rank][esl_rank]`.
+    // ------------------------------------------------------------
+    if (sip_id == 1) {
+        int **barrier_int_ptrs = barrier_signal_ptrs;
+        // A magic flag value that is unlikely to collide with normal barrier counters.
+        // (Keep it simple and stable; readers can key off this exact pattern.)
+        constexpr int kInternodeSpecialFlag = 0x5A5AA5A5;
+        volatile int *src_flag_ptr = reinterpret_cast<volatile int *>(barrier_int_ptrs[esl_rank] + esl_rank);
+        *src_flag_ptr = kInternodeSpecialFlag;
+        tcle::fence<L3_MEM_STORE>();
+        // Each subthread sends to one dst_esl_rank, collectively covering all peers.
+        if (sub_id < esl_rank_num) {
+            int dst_esl_rank = sub_id;
+            int dst_rank = rdma_rank * esl_rank_num + dst_esl_rank;
+            int *dst_flag_ptr = barrier_int_ptrs[esl_rank] + esl_rank;
+            if (dst_rank != rank) {
+                prim.send_esl(dst_flag_ptr, (int *)src_flag_ptr, dst_rank, 1);
+                prim.ring_doorbell(dst_rank);
+                prim.wait_esl_trans_done(dst_rank);
+            }
+        }
+        __syncsubthreads();
+        // Wait until we have received special flags from all src_esl_rank.
+        // Each subthread is responsible for polling one src_esl_rank.
+        int src_esl_rank = sub_id;
+        volatile int *my_ptr = reinterpret_cast<volatile int *>(barrier_signal_ptrs[esl_rank] + src_esl_rank);
+        uint64_t wait_start = tops::clock64();
+        bool wait_timeout_printed = false;
+        if (src_esl_rank < esl_rank_num) {
+          while (true) {
+              if (*my_ptr == kInternodeSpecialFlag) {
+                  *(volatile int *)(barrier_signal_ptrs[esl_rank] + src_esl_rank) = 0;
+                  break;
+              }
+              if (!wait_timeout_printed && (tops::clock64() - wait_start > kDispatchTimeoutCycles)) {
+                  printf("[dispatch][ESL special flag wait timeout] rank=%d rdma_rank=%d esl_rank=%d channel=%d src_esl_rank=%d val=%d\n",
+                         rank, rdma_rank, esl_rank, channel_id, src_esl_rank, (int)(*my_ptr));
+                  wait_timeout_printed = true;
+              }
+          }
+        }
+    }
+    tops::sync_grid_threads();
+    if (is_rdma_sender && channel_id == 0) {
+        int dst_rank = sub_id * esl_rank_num + esl_rank;
+        int dst_rdma_rank = dst_rank / esl_rank_num;
+        constexpr int kInternodeSpecialFlag = 0x5A5AA5A5;
+        volatile int *src_barrier_int_ptrs = rdma_channel_barrier_buffer.send_buffer(dst_rdma_rank);
+        volatile int *dst_barrier_int_ptrs = rdma_channel_barrier_buffer.recv_buffer(rdma_rank);
+        *src_barrier_int_ptrs = kInternodeSpecialFlag;
+        tcle::fence<L3_MEM_STORE>();
+        if (dst_rank != rank) {
+            prim.send_rdma(dst_barrier_int_ptrs, src_barrier_int_ptrs, dst_rank, 1, false, true);
+        } else {
+            *(volatile int*)(rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank)) = kInternodeSpecialFlag;
+        }
+        while (true) {
+            volatile int *my_barrier_int_ptrs = rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank);
+            if (*my_barrier_int_ptrs == kInternodeSpecialFlag) {
+                *(volatile int*)(rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank)) = 0;
+                break;
+            }
+        }
+        *src_barrier_int_ptrs = 0;
+    }
+    tops::sync_grid_threads();
+    // Parallel clean: all SIPs and subthreads participate.
+    const int num_subthreads = static_cast<int>(threadDim.x);
+    const int clean_worker_num = sip_num * num_subthreads;
+    const int clean_worker_id = sip_id * num_subthreads + sub_id;
+    __vector int all_zero = (__vector int)(0);
+    auto rdma_buffer_dispatch_clean_int = static_cast<int *>((void*)rdma_buffer_dispatch_clean);
+    for (int rdma_clean_offset = clean_worker_id * 128;
+            rdma_clean_offset < rdma_num_int_clean;
+            rdma_clean_offset += clean_worker_num * 128) {
+        int vl_cur = (rdma_num_int_clean - rdma_clean_offset) < 128
+                   ? rdma_num_int_clean - rdma_clean_offset
+                   : 128;
+        tcle::set_vl(vl_cur);
+        tcle::store(all_zero, rdma_buffer_dispatch_clean_int + rdma_clean_offset);
+    }
+    auto esl_buffer_ptr_int = static_cast<int*>((void*)(nvl_buffer_dispatch_clean));
+    for (int esl_clean_offset = clean_worker_id * 128;
+            esl_clean_offset < esl_num_int_clean;
+            esl_clean_offset += clean_worker_num * 128) {
+        int vl_cur = (esl_num_int_clean - esl_clean_offset) < 128
+                   ? esl_num_int_clean - esl_clean_offset
+                   : 128;
+        tcle::set_vl(vl_cur);
+        tcle::store(all_zero, esl_buffer_ptr_int + esl_clean_offset);
+    }
+    tcle::fence<L3_MEM_STORE>();
+    tops::sync_grid_threads();
+    // ------------------------------------------------------------
+    // After ESL receiver finishes: broadcast a special flag to other
+    // intra-node cards via `barrier_signal_ptrs`.
+    //
+    // Use `barrier_signal_ptrs[esl_rank][esl_rank]` as local staging,
+    // and send it to `barrier_signal_ptrs[dst_esl_rank][esl_rank]`.
+    // ------------------------------------------------------------
+    if (sip_id == 1) {
+        int **barrier_int_ptrs = barrier_signal_ptrs;
+        // A magic flag value that is unlikely to collide with normal barrier counters.
+        // (Keep it simple and stable; readers can key off this exact pattern.)
+        constexpr int kInternodeSpecialFlag = 0x5A5AA5A5;
+        volatile int *src_flag_ptr = reinterpret_cast<volatile int *>(barrier_int_ptrs[esl_rank] + esl_rank);
+        *src_flag_ptr = kInternodeSpecialFlag;
+        tcle::fence<L3_MEM_STORE>();
+        // Each subthread sends to one dst_esl_rank, collectively covering all peers.
+        if (sub_id < esl_rank_num) {
+            int dst_esl_rank = sub_id;
+            int dst_rank = rdma_rank * esl_rank_num + dst_esl_rank;
+            int *dst_flag_ptr = barrier_int_ptrs[esl_rank] + esl_rank;
+            if (dst_rank != rank) {
+                prim.send_esl(dst_flag_ptr, (int *)src_flag_ptr, dst_rank, 1);
+                prim.ring_doorbell(dst_rank);
+                prim.wait_esl_trans_done(dst_rank);
+            }
+        }
+        __syncsubthreads();
+        // Wait until we have received special flags from all src_esl_rank.
+        // Each subthread is responsible for polling one src_esl_rank.
+        int src_esl_rank = sub_id;
+        if (src_esl_rank < esl_rank_num) {
+            volatile int *my_ptr = reinterpret_cast<volatile int *>(barrier_signal_ptrs[esl_rank] + src_esl_rank);
+            uint64_t wait_start = tops::clock64();
+            bool wait_timeout_printed = false;
+            while (true) {
+                if (*my_ptr == kInternodeSpecialFlag) {
+                    *(volatile int *)(barrier_signal_ptrs[esl_rank] + src_esl_rank) = 0;
+                    break;
+                }
+                if (!wait_timeout_printed && (tops::clock64() - wait_start > kDispatchTimeoutCycles)) {
+                    printf("[dispatch][ESL special flag wait timeout] rank=%d rdma_rank=%d esl_rank=%d channel=%d src_esl_rank=%d val=%d\n",
+                           rank, rdma_rank, esl_rank, channel_id, src_esl_rank, (int)(*my_ptr));
+                    wait_timeout_printed = true;
+                }
+            }
+        }
+    }
+    tops::sync_grid_threads();
+    if (is_rdma_sender && channel_id == 0) {
+        int dst_rank = sub_id * esl_rank_num + esl_rank;
+        int dst_rdma_rank = dst_rank / esl_rank_num;
+        constexpr int kInternodeSpecialFlag = 0x5A5AA5A5;
+        volatile int *src_barrier_int_ptrs = rdma_channel_barrier_buffer.send_buffer(dst_rdma_rank);
+        volatile int *dst_barrier_int_ptrs = rdma_channel_barrier_buffer.recv_buffer(rdma_rank);
+        *src_barrier_int_ptrs = kInternodeSpecialFlag;
+        tcle::fence<L3_MEM_STORE>();
+        if (dst_rank != rank) {
+            prim.send_rdma(dst_barrier_int_ptrs, src_barrier_int_ptrs, dst_rank, 1, false, true);
+        } else {
+            *(volatile int*)(rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank)) = kInternodeSpecialFlag;
+        }
+        while (true) {
+            volatile int *my_barrier_int_ptrs = rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank);
+            if (*my_barrier_int_ptrs == kInternodeSpecialFlag) {
+                *(volatile int*)(rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank)) = 0;
+                break;
+            }
+        }
+        *src_barrier_int_ptrs = 0;
+    }
+    tops::sync_grid_threads();
+}
+
+void dispatch(void *recv_x,
+              float *recv_x_scales,
+              int *recv_topk_idx,
+              float *recv_topk_weights,
+              void *recv_src_meta,
+              const void *x,
+              const float *x_scales,
+              const int *topk_idx,
+              const float *topk_weights,
+              int *send_rdma_head,
+              int *send_nvl_head,
+              int *recv_rdma_channel_prefix_matrix,
+              int *recv_gbl_channel_prefix_matrix,
+              const int *rdma_channel_prefix_matrix,
+              const int *recv_rdma_rank_prefix_sum,
+              const int *gbl_channel_prefix_matrix,
+              const int *recv_gbl_rank_prefix_sum,
+              const bool *is_token_in_rank,
+              int num_tokens,
+              int hidden_int4,
+              int num_scales,
+              int num_topk,
+              int num_experts,
+              int scale_token_stride,
+              int scale_hidden_stride,
+              void *rdma_buffer_ptr,
+              int num_max_rdma_chunked_send_tokens,
+              int num_max_rdma_chunked_recv_tokens,
+              void **buffer_ptrs,
+              int **barrier_signal_ptrs,
+              int num_max_nvl_chunked_send_tokens,
+              int num_max_nvl_chunked_recv_tokens,
+              int rank,
+              int num_ranks,
+              int num_nvl_ranks,
+              bool is_cached_dispatch,
+              topsStream_t stream,
+              int num_channels,
+              bool low_latency_mode,
+              struct primitives *prims) {
+    int hidden_bytes = hidden_int4 * 16;
+    EP_HOST_ASSERT(num_nvl_ranks <= 8);
+    SETUP_LAUNCH_CONFIG(num_channels, 2, 8, stream);
+
+    int num_rdma_ranks = num_ranks / num_nvl_ranks;
+
+
+#define DISPATCH_LAUNCH_CASE(ESL_RANKS, RDMA_RANKS) { \
+    auto kernel = dispatch<ESL_RANKS, RDMA_RANKS>; \
+    LAUNCH_KERNEL(&cfg, kernel, (uint8_t *)x, (uint8_t *)is_token_in_rank, (int *)topk_idx, (float *)topk_weights, \
+                  (int *)rdma_channel_prefix_matrix, (int *)gbl_channel_prefix_matrix, (int *)recv_rdma_rank_prefix_sum, \
+                  (int *)recv_gbl_rank_prefix_sum, (uint8_t *)recv_x, recv_topk_idx, recv_topk_weights, (int *)recv_src_meta, \
+                  recv_rdma_channel_prefix_matrix, recv_gbl_channel_prefix_matrix, send_rdma_head, send_nvl_head, num_tokens, \
+                  hidden_bytes, rank, num_topk, num_experts, num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens, \
+                  num_max_nvl_chunked_recv_tokens, num_max_nvl_chunked_send_tokens, (uint8_t **)buffer_ptrs, \
+                  barrier_signal_ptrs, (uint8_t *)rdma_buffer_ptr, prims); \
+     }
+
+    ESL_SWITCH(num_nvl_ranks, ESL_RANKS, [&] {
+      RDMA_SWITCH(num_rdma_ranks, RDMA_RANKS, [&] {
+        DISPATCH_LAUNCH_CASE(ESL_RANKS, RDMA_RANKS);
+      });
+    });
+}
+
+template <bool kLowLatencyMode, int kNumTMABytesPerWarp>
+__global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_int_clean,
+                              const int nvl_clean_offset, const int nvl_num_int_clean,
+                              int* combined_rdma_head, int num_combined_tokens, int num_channels,
+                              const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, int* combined_nvl_head,
+                              void* rdma_buffer_ptr,
+                              void** buffer_ptrs, int** barrier_signal_ptrs, int rank, int num_ranks, int num_nvl_ranks,
+                              bool is_cached_dispatch, const void * rdma_team) {
+    const auto num_sms = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+    // auto subthread_id = static_cast<int>(subThreadIdx.x), num_subthreads = static_cast<int>(threadDim.x);
+
+    int num_max_nvl_peers_hack = NUM_MAX_NVL_PEERS;
+    // auto nvl_rank = rank % 8;
+    auto num_rdma_ranks = num_ranks / num_nvl_ranks;
+    
+    // printf("in cached_notify kernel, sm_id: %d, num_rdma_ranks: %d, num_ranks: %d, num_channels: %d\n",
+            // sm_id, num_rdma_ranks, num_ranks, num_channels);
+
+    __local__ __valigned__ char local_buf[640 * 1024];
+
+    if (sm_id == 0) {
+        // long long start = tops::clock64();
+        // clean RDMA buffer
+        // __vector int all_zero = (__vector int)(0);
+        // // tcle::set_spr<VL>(TCLE_MAX_VECTOR_LENGTH);
+        // auto rdma_buffer_ptr_int = static_cast<int *>(rdma_buffer_ptr);
+        // for (int i = 0; i < rdma_num_int_clean; i += TCLE_MAX_VECTOR_LENGTH) {
+        //     int vl_cur = (rdma_num_int_clean - i) < TCLE_MAX_VECTOR_LENGTH
+        //                ? rdma_num_int_clean - i
+        //                : TCLE_MAX_VECTOR_LENGTH;
+        //     tcle::set_spr<VL>(vl_cur);
+        //     tcle::store(all_zero, rdma_buffer_ptr_int + rdma_clean_offset);
+        // }
+        // tcle::set_spr<VL>(TCLE_MAX_VECTOR_LENGTH);
+
+        // clean NVL buffer
+        // auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
+        // for (int i = 0; i < nvl_num_int_clean; i += TCLE_MAX_VECTOR_LENGTH) {
+        //     int vl_cur = (nvl_num_int_clean - i) < TCLE_MAX_VECTOR_LENGTH
+        //                ? nvl_num_int_clean - i
+        //                : TCLE_MAX_VECTOR_LENGTH;
+        //     tcle::set_spr<VL>(vl_cur);
+        //     tcle::store(all_zero, nvl_buffer_ptr_int + nvl_clean_offset);
+        // }
+        // tcle::set_spr<VL>(TCLE_MAX_VECTOR_LENGTH);
+        // printf("in kernel, core 0, last clock cycle = %llu\n", tops::clock64() - start);
+    } else if (sm_id == 1) {
+        // long long start = tops::clock64();
+        if (is_cached_dispatch) {
+            return;
+        }
+
+        int combined_rdma_size = 128 * 1024;
+        // int num_tokens_per_batch = combined_rdma_size / (sizeof(int) * num_rdma_ranks);
+        int local_off = 0;
+        int* local_combined_rdma_in[2];
+        int* local_combined_rdma_out[2];
+        local_combined_rdma_in[0] = reinterpret_cast<int*>(local_buf);
+        local_off += (combined_rdma_size + 511) / 512 * 512;
+        local_combined_rdma_in[1] = reinterpret_cast<int*>(local_buf + local_off);
+        local_off += (combined_rdma_size + 511) / 512 * 512;
+        local_combined_rdma_out[0] = reinterpret_cast<int*>(local_buf + local_off);
+        local_off += (combined_rdma_size + 511) / 512 * 512;
+        local_combined_rdma_out[1] = reinterpret_cast<int*>(local_buf + local_off);
+
+        tops::local_dte combined_head_in_ctx[2];
+        tops::local_dte combined_head_out_ctx[2];
+        tops::event head_in_event[2];
+        tops::event head_out_event[2];
+        combined_head_in_ctx[0].init();
+        combined_head_in_ctx[1].init();
+        combined_head_out_ctx[0].init();
+        combined_head_out_ctx[1].init();
+
+        int num_tokens_per_channel = (num_combined_tokens + num_channels - 1) / num_channels;
+        combined_head_in_ctx[0].config_slice(tops::mdspan(tops::Local, local_combined_rdma_in[0],
+                                            num_tokens_per_channel, num_rdma_ranks),
+                            tops::mdspan(tops::Global, combined_rdma_head,
+                                            num_tokens_per_channel, num_rdma_ranks), {0, 0});
+        combined_head_in_ctx[1].config_slice(tops::mdspan(tops::Local, local_combined_rdma_in[1],
+                                            num_tokens_per_channel, num_rdma_ranks),
+                            tops::mdspan(tops::Global, combined_rdma_head,
+                                            num_tokens_per_channel, num_rdma_ranks), {0, 0});
+        combined_head_out_ctx[0].config_slice(tops::mdspan(tops::Global, combined_rdma_head,
+                                                num_tokens_per_channel, num_rdma_ranks),
+                                tops::mdspan(tops::Local, local_combined_rdma_out[0],
+                                                num_tokens_per_channel, num_rdma_ranks), {0, 0});
+        combined_head_out_ctx[1].config_slice(tops::mdspan(tops::Global, combined_rdma_head,
+                                                num_tokens_per_channel, num_rdma_ranks),
+                                tops::mdspan(tops::Local, local_combined_rdma_out[1],
+                                                num_tokens_per_channel, num_rdma_ranks), {0, 0});
+
+        combined_head_in_ctx[0].set_src_addr(combined_rdma_head);
+        combined_head_in_ctx[0].set_src_dim_size(0, num_tokens_per_channel);
+        if (num_tokens_per_channel > 0) {
+            head_in_event[0] = combined_head_in_ctx[0].trigger();
+        }
+
+        int pq_flag = 0;
+        // need to opt parallel between channels
+        for (int warp_idx = 0; warp_idx < num_channels; warp_idx++) {
+            int cur_idx = pq_flag;
+            int nxt_idx = 1 - pq_flag;
+
+            int token_start_idx = (num_tokens_per_channel * warp_idx) < num_combined_tokens
+                                ? num_tokens_per_channel * warp_idx
+                                : num_combined_tokens;
+            int token_end_idx = (token_start_idx + num_tokens_per_channel) < num_combined_tokens
+                              ? token_start_idx + num_tokens_per_channel
+                              : num_combined_tokens;
+            if (token_start_idx >= token_end_idx) {
+                break;
+            }
+            __vector int v_last_head = (__vector int)(1 << 25);
+            // dte from L3 to L1
+            if (warp_idx + 1 < num_channels) {
+                int token_start_idx_nxt = (num_tokens_per_channel * (warp_idx + 1)) < num_combined_tokens
+                                        ? num_tokens_per_channel * (warp_idx + 1)
+                                        : num_combined_tokens;
+                int token_end_idx_nxt = (token_start_idx_nxt + num_tokens_per_channel) < num_combined_tokens
+                                      ? token_start_idx_nxt + num_tokens_per_channel
+                                      : num_combined_tokens;
+                if (token_start_idx_nxt < token_end_idx_nxt) {
+                    combined_head_in_ctx[nxt_idx].set_src_addr(combined_rdma_head
+                                                    + token_start_idx_nxt * num_rdma_ranks);
+                    combined_head_in_ctx[nxt_idx].set_dst_addr(local_combined_rdma_in[nxt_idx]);
+                    combined_head_in_ctx[nxt_idx].set_src_dim_size(0,
+                                                    token_end_idx_nxt - token_start_idx_nxt);
+                    head_in_event[nxt_idx] = combined_head_in_ctx[nxt_idx].trigger();
+                }
+            }
+            if (warp_idx > 0) {
+                head_out_event[nxt_idx].wait();
+            }
+            head_in_event[cur_idx].wait();
+
+            tcle::set_spr<VL>(num_rdma_ranks);
+            #pragma unroll(64)
+            for (int token_idx = token_end_idx - token_start_idx - 1; token_idx >= 0; --token_idx) {
+                __vector int v_current_head = tcle::load<__vector int>(local_combined_rdma_in[cur_idx]
+                                            + token_idx * num_rdma_ranks);
+                __vector bool int v_neg = v_current_head < 0;
+                __vector int v_rst = tcle::vsel(v_neg,
+                                            (__vector int)(-1) - v_last_head, v_current_head);
+                v_last_head = tcle::vsel(v_neg, v_last_head, v_current_head);
+                tcle::store(v_rst, local_combined_rdma_out[cur_idx] + token_idx * num_rdma_ranks);
+            }
+            tcle::fence<0x92>();
+            // dte from L1 to L3
+            combined_head_out_ctx[cur_idx].set_dst_addr(combined_rdma_head
+                                                + token_start_idx * num_rdma_ranks);
+            combined_head_out_ctx[cur_idx].set_src_addr(local_combined_rdma_out[cur_idx]);
+            combined_head_out_ctx[cur_idx].set_src_dim_size(0, token_end_idx - token_start_idx);
+            combined_head_out_ctx[cur_idx].set_dst_dim_size(0, token_end_idx - token_start_idx);
+            head_out_event[cur_idx] = combined_head_out_ctx[cur_idx].trigger();
+            pq_flag = 1 - pq_flag;
+        }
+        if (num_tokens_per_channel > 0) {
+            head_out_event[1 - pq_flag].wait();
+        }   
+        tcle::set_spr<VL>(TCLE_MAX_VECTOR_LENGTH);
+
+        combined_head_in_ctx[0].destroy();
+        combined_head_in_ctx[1].destroy();
+        combined_head_out_ctx[0].destroy();
+        combined_head_out_ctx[1].destroy();
+        // printf("in kernel, core 1, last clock cycle = %llu\n", tops::clock64() - start);
+    } else {
+        if (is_cached_dispatch) {
+            return;
+        }
+
+        int combined_nvl_size = 128 * 1024;
+        int num_tokens_per_batch = combined_nvl_size / (sizeof(int) * num_max_nvl_peers_hack);
+        int local_off = 0;
+        // int* local_prefix_matrix = reinterpret_cast<int*>(local_buf);
+        local_off += (num_rdma_ranks * num_channels * sizeof(int) + 511) / 512 * 512;   // align up
+        // int* local_prefix_sum = reinterpret_cast<int*>(local_buf + local_off);
+        local_off += (num_rdma_ranks + 511) / 512 * 512;                    // align up
+
+        int* local_combined_nvl_in[2];
+        int* local_combined_nvl_out[2];
+        local_combined_nvl_in[0] = reinterpret_cast<int*>(local_buf + local_off);
+        local_off += (combined_nvl_size + 511) / 512 * 512;
+        local_combined_nvl_in[1] = reinterpret_cast<int*>(local_buf + local_off);
+        local_off += (combined_nvl_size + 511) / 512 * 512;
+        local_combined_nvl_out[0] = reinterpret_cast<int*>(local_buf + local_off);
+        local_off += (combined_nvl_size + 511) / 512 * 512;
+        local_combined_nvl_out[1] = reinterpret_cast<int*>(local_buf + local_off);
+
+        tops::local_dte combined_head_in_ctx[2];
+        tops::local_dte combined_head_out_ctx[2];
+        tops::event head_in_event[2];
+        tops::event head_out_event[2];
+
+        combined_head_in_ctx[0].init();
+        combined_head_in_ctx[1].init();
+        combined_head_out_ctx[0].init();
+        combined_head_out_ctx[1].init();
+
+        combined_head_in_ctx[0].config_slice(tops::mdspan(tops::Local, local_combined_nvl_in[0],
+                                            1, num_max_nvl_peers_hack),
+                            tops::mdspan(tops::Global, combined_nvl_head,
+                                            1, num_max_nvl_peers_hack), {0, 0});
+        combined_head_in_ctx[1].config_slice(tops::mdspan(tops::Local, local_combined_nvl_in[1],
+                                            1, num_max_nvl_peers_hack),
+                            tops::mdspan(tops::Global, combined_nvl_head,
+                                            1, num_max_nvl_peers_hack), {0, 0});
+        combined_head_out_ctx[0].config_slice(tops::mdspan(tops::Global, combined_nvl_head,
+                                                1, num_max_nvl_peers_hack),
+                                tops::mdspan(tops::Local, local_combined_nvl_out[0],
+                                                1, num_max_nvl_peers_hack), {0, 0});
+        combined_head_out_ctx[1].config_slice(tops::mdspan(tops::Global, combined_nvl_head,
+                                                1, num_max_nvl_peers_hack),
+                                tops::mdspan(tops::Local, local_combined_nvl_out[1],
+                                                1, num_max_nvl_peers_hack), {0, 0});
+
+        for (int dst_rdma_rank = sm_id - 2; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_sms - 2) {
+            // need to opt parallel between channels
+            int pq_flag = 0;
+            int has_trigger = 0;
+            int has_trigger_in = 0;
+            for (int warp_idx = 0; warp_idx < num_channels; warp_idx++) {
+                int token_start_idx = warp_idx == 0
+                                    ? 0
+                                    : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_idx - 1];
+                int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_idx];
+                int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
+                token_start_idx += shift, token_end_idx += shift;
+
+                __vector int v_last_head = (__vector int)(1 << 25);
+                int batch_count = 0;
+
+                for (int batch_end_idx = token_end_idx; batch_end_idx > token_start_idx;
+                                                        batch_end_idx -= num_tokens_per_batch) {
+                    int cur_idx = pq_flag;
+                    int nxt_idx = 1 - pq_flag;
+
+                    auto batch_start_idx = token_start_idx > batch_end_idx - num_tokens_per_batch
+                                         ? token_start_idx
+                                         : batch_end_idx - num_tokens_per_batch;
+
+                    // 判断是否有下一个 batch（当前 warp_idx 内）
+                    bool has_next_batch_in_warp = (batch_end_idx - num_tokens_per_batch > token_start_idx);
+                    // 判断是否有下一个 warp_idx
+                    bool has_next_warp = (warp_idx + 1 < num_channels);
+
+                    // 1. 等待前一个 batch 的输出完成
+                    //    - 如果不是第一个 batch（batch_count > 0），等待前一个 batch 的输出
+                    //    - 如果是新 warp_idx 的第一个 batch（batch_count == 0 && warp_idx > 0），等待前一个 warp 的输出
+                    if (has_trigger) {
+                        head_out_event[nxt_idx].wait();
+                        has_trigger = 0;
+                    }
+
+                    // 2. 处理当前 batch 的输入
+                    if (batch_count == 0 && has_trigger_in == 0 && (batch_start_idx < batch_end_idx)) {
+                        // 当前 batch 未预取，显式触发输入（处理空 channel 跳过的场景）
+                        combined_head_in_ctx[cur_idx].set_src_addr(combined_nvl_head
+                                                            + batch_start_idx * num_max_nvl_peers_hack);
+                        combined_head_in_ctx[cur_idx].set_src_dim_size(0, batch_end_idx - batch_start_idx);
+                        combined_head_in_ctx[cur_idx].set_dst_dim_size(0, batch_end_idx - batch_start_idx);
+                        head_in_event[cur_idx] = combined_head_in_ctx[cur_idx].trigger();
+                        has_trigger_in = 1;
+                    }
+                    // 等待当前 batch 的输入完成
+                    if (has_trigger_in == 1) {
+                        head_in_event[cur_idx].wait();
+                        has_trigger_in = 0;
+                    }
+
+                    // 3. 预取下一个 batch 的输入（如果存在）
+                    if (has_next_batch_in_warp) {
+                        // 预取当前 warp_idx 的下一个 batch
+                        int batch_end_idx_next = batch_end_idx - num_tokens_per_batch;
+                        int batch_start_idx_next = token_start_idx > batch_end_idx_next - num_tokens_per_batch
+                                                  ? token_start_idx
+                                                  : batch_end_idx_next - num_tokens_per_batch;
+                        if (batch_start_idx_next < batch_end_idx_next) {
+                            combined_head_in_ctx[nxt_idx].set_src_addr(combined_nvl_head
+                                                                + batch_start_idx_next * num_max_nvl_peers_hack);
+                            combined_head_in_ctx[nxt_idx].set_src_dim_size(0, batch_end_idx_next - batch_start_idx_next);
+                            combined_head_in_ctx[nxt_idx].set_dst_dim_size(0, batch_end_idx_next - batch_start_idx_next);
+                            head_in_event[nxt_idx] = combined_head_in_ctx[nxt_idx].trigger();
+                            has_trigger_in = 1;
+                        }
+                    } else if (has_next_warp) {
+                        // 预取下一个 warp_idx 的第一个 batch
+                        int token_start_idx_nxt = rdma_channel_prefix_matrix[dst_rdma_rank
+                                                            * num_channels + warp_idx];
+                        int token_end_idx_nxt = rdma_channel_prefix_matrix[dst_rdma_rank
+                                                            * num_channels + warp_idx + 1];
+                        token_start_idx_nxt += shift;
+                        token_end_idx_nxt += shift;
+                        int batch_end_idx_nxt = token_end_idx_nxt;
+                        int batch_start_idx_nxt = token_start_idx_nxt > batch_end_idx_nxt - num_tokens_per_batch
+                                                ? token_start_idx_nxt
+                                                : batch_end_idx_nxt - num_tokens_per_batch;
+
+                        if (batch_start_idx_nxt < batch_end_idx_nxt) {
+                            combined_head_in_ctx[nxt_idx].set_src_addr(combined_nvl_head
+                                                                + batch_start_idx_nxt * num_max_nvl_peers_hack);
+                            combined_head_in_ctx[nxt_idx].set_src_dim_size(0, batch_end_idx_nxt - batch_start_idx_nxt);
+                            combined_head_in_ctx[nxt_idx].set_dst_dim_size(0, batch_end_idx_nxt - batch_start_idx_nxt);
+                            head_in_event[nxt_idx] = combined_head_in_ctx[nxt_idx].trigger();
+                            has_trigger_in = 1;
+                        }
+                    }
+
+                    // 4. L1 compute
+                    tcle::set_spr<VL>(num_max_nvl_peers_hack);
+                    #pragma unroll(64)
+                    for (int token_idx = batch_end_idx - batch_start_idx - 1; token_idx >= 0; --token_idx) {
+                        __vector int v_current_head = tcle::load<__vector int>(local_combined_nvl_in[cur_idx]
+                                                            + token_idx * num_max_nvl_peers_hack);
+                        __vector int v_rst = tcle::vsel(v_current_head < 0,
+                                                    (__vector int)(-1) - v_last_head, v_current_head);
+                        tcle::store(v_rst, local_combined_nvl_out[cur_idx]
+                                                            + token_idx * num_max_nvl_peers_hack);
+                        v_last_head = tcle::vsel(v_current_head < 0,
+                                                    v_last_head, v_current_head);
+                    }
+                    tcle::fence<0x92>();
+
+                    // 5. 输出当前 batch 的结果
+                    combined_head_out_ctx[cur_idx].set_dst_addr(combined_nvl_head
+                                                            + batch_start_idx * num_max_nvl_peers_hack);
+                    combined_head_out_ctx[cur_idx].set_src_dim_size(0, batch_end_idx - batch_start_idx);
+                    combined_head_out_ctx[cur_idx].set_dst_dim_size(0, batch_end_idx - batch_start_idx);
+                    head_out_event[cur_idx] = combined_head_out_ctx[cur_idx].trigger();
+                    has_trigger = 1;
+
+                    // 6. 切换 ping-pong flag（为下一个 batch 准备）
+                    pq_flag = 1 - pq_flag;
+                    batch_count++;
+                }
+            }
+            if (has_trigger == 1) {
+                head_out_event[1 - pq_flag].wait();
+                has_trigger = 0;
+              }
+            tcle::set_spr<VL>(TCLE_MAX_VECTOR_LENGTH);
+        }
+        combined_head_in_ctx[0].destroy();
+        combined_head_in_ctx[1].destroy();
+        combined_head_out_ctx[0].destroy();
+        combined_head_out_ctx[1].destroy();
+        // printf("in kernel, core 2, last clock cycle\n");
+    }
+}
+
+void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights,
+                   int num_ranks, int num_nvl_ranks, int num_channels, int num_device_sms, int max_threads_per_sm,
+                   int num_combined_tokens, int* combined_rdma_head,
+                   const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, int* combined_nvl_head,
+                   void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens,
+                   void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
+                   int** barrier_signal_ptrs, int rank, topsStream_t stream,
+                   int64_t num_rdma_bytes, int64_t num_nvl_bytes,
+                   bool is_cached_dispatch, bool low_latency_mode) {
+#define CACHED_NOTIFY_HOST { \
+    LAUNCH_KERNEL(&cfg, cached_notify_func, rdma_clean_offset, rdma_num_int_clean, \
+        nvl_clean_offset, nvl_num_int_clean, combined_rdma_head, num_combined_tokens, \
+        num_channels, rdma_channel_prefix_matrix, rdma_rank_prefix_sum, combined_nvl_head, \
+        rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank, num_ranks, num_nvl_ranks, \
+        is_cached_dispatch, nullptr); }
+    int SIZE_OF_INT4 = 16;
+    int num_bytes_per_token = (hidden_int4 * SIZE_OF_INT4 + sizeof(SourceMeta) + num_scales * sizeof(float)
+                                    + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float)
+                                    + SIZE_OF_INT4 - 1) / SIZE_OF_INT4 * SIZE_OF_INT4;
+    int num_rdma_ranks = (num_ranks + num_nvl_ranks - 1) / num_nvl_ranks;
+    int rdma_clean_offset = num_bytes_per_token * num_max_rdma_chunked_recv_tokens
+                                    * num_rdma_ranks * 2 * num_channels / sizeof(int);
+    // +5 covers rdma head/tail/cache_head/barrier metadata in combine layout.
+    int rdma_num_int_clean = (num_nvl_ranks * 2 + 5) * num_rdma_ranks * 2 * num_channels;
+
+    EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+
+    int nvl_clean_offset = num_max_nvl_chunked_recv_tokens * (num_bytes_per_token / sizeof(int)) * num_nvl_ranks
+                                * num_channels;
+    int nvl_num_int_clean = num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels;
+
+    // printf("rdma_off: %d, rdma_num: %d, nvl_off: %d, nvl_num: %d\n", rdma_clean_offset, rdma_num_int_clean,
+    //                                         nvl_clean_offset, nvl_num_int_clean);
+    static constexpr int l1_bytes = 8192;
+    auto cached_notify_func = low_latency_mode
+                            ? cached_notify<true, l1_bytes>
+                            : cached_notify<false, l1_bytes>;
+
+    SETUP_LAUNCH_CONFIG(num_device_sms, max_threads_per_sm, 1, stream);
+    CACHED_NOTIFY_HOST;
+#undef CACHED_NOTIFY_HOST
+}
+
+template<int kNumESLRanks, int kNumRDMARanks>
+__global__ __cooperative__ void combine(tops::__ef_bfloat16* combined_x, float* combined_topk_weights,
+                        const bool* is_combined_token_in_rank,
+                        const tops::__ef_bfloat16* x, const float* topk_weights,
+                        const tops::__ef_bfloat16* bias_0, const tops::__ef_bfloat16* bias_1,
+                        const int* combined_rdma_head, const int* combined_esl_head,
+                        const SourceMeta* src_meta, const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum,
+                        const int* gbl_channel_prefix_matrix, int num_tokens, int num_combined_tokens, int hidden, int num_topk,
+                        void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
+                        void** buffer_ptrs, int num_max_esl_chunked_send_tokens, int num_max_esl_chunked_recv_tokens,
+                        int** barrier_signal_ptrs, int rank, int num_ranks, int num_channels, struct primitives* prims) {
+    const int NUM_ESL_PEERS = kNumESLRanks;
+    const int kNumRDMAReceivers = kNumRDMARanks;
+    const auto rdma_rank = rank / NUM_ESL_PEERS;
+    const auto esl_rank = rank % NUM_ESL_PEERS;
+    // Timeout watchdog for busy-wait loops inside combine kernel.
+    static constexpr uint64_t kCombineTimeoutCycles = NUM_TIMEOUT_CYCLES/10;
+    // Sample timeout checks every N spins to reduce hot-loop clock reads.
+    static constexpr uint32_t kCombineTimeoutCheckInterval = 256;
+    static constexpr uint32_t kCombineHeadUpdateInterval = 6400;
+    static constexpr int kRecvHeadSendStep = 8;
+    static constexpr int kInternodeSpecialFlag = 0x5A5AA5A5;
+    int num_max_esl_chunked_recv_tokens_per_rdma = num_max_esl_chunked_recv_tokens / kNumRDMARanks;
+
+    const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+    const auto subthread_id = static_cast<int>(subThreadIdx.x);
+    const auto channel_id = sm_id / 2;
+
+    int elem_bytes = sizeof(tops::__ef_bfloat16);
+    int num_bytes_per_token = hidden * elem_bytes;
+    int hidden_bytes = hidden * elem_bytes;
+    if (num_topk > 0) {
+        num_bytes_per_token = num_bytes_per_token + num_topk * sizeof(float) + sizeof(SourceMeta);
+    }
+
+    // init combined buffers
+    uint8_t* esl_buffers[NUM_ESL_PEERS];
+    #pragma unroll
+    for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+        esl_buffers[i] = reinterpret_cast<uint8_t*>(buffer_ptrs[i]) + NOTIFY_DISPATCH_OFFSET;
+    }
+    uint8_t* rdma_buffer_combine = reinterpret_cast<uint8_t*>(rdma_buffer_ptr) + NOTIFY_DISPATCH_OFFSET;
+    uint8_t* esl_buffer_combine_clean = esl_buffers[esl_rank];
+    uint8_t* rdma_buffer_combine_clean = rdma_buffer_combine;
+
+    bool is_esl_sender = sm_id % 2 == 0;
+    static constexpr int kMaxForwarderTotal = 6;
+    static constexpr int kForwarderGroupSize = (kMaxForwarderTotal / kNumRDMARanks) > 0 ? (kMaxForwarderTotal / kNumRDMARanks) : 1;
+    static constexpr int kForwarderTotal = kNumRDMARanks * kForwarderGroupSize;
+    static constexpr int kNumSecondariesPerGroup = (kForwarderGroupSize > 1) ? (kForwarderGroupSize - 1) : 1;
+    bool is_els_rdma_forwarder = sm_id % 2 == 1 && subthread_id < kForwarderTotal;
+    bool is_rdma_receiver = sm_id % 2 == 1 && subthread_id >= kForwarderTotal;
+    int receiver_id = subthread_id - kForwarderTotal;
+
+    // init primitives
+    Prim<NUM_ESL_PEERS, kNumRDMARanks> prim;
+    Prim<NUM_ESL_PEERS, kNumRDMARanks, true> prim_s, *prim_shared = nullptr;
+    tops::local_barrier bar1;
+    if (is_esl_sender) {
+        prim.init_esl(prims[channel_id + num_channels].primitive, rank, esl_buffers);
+    }
+    if (is_els_rdma_forwarder) {
+        if (subthread_id == 0) {
+            prim_s.init_esl(prims[channel_id].primitive, rank, esl_buffers);
+        }
+        const bool is_primary_fwd_init = (subthread_id < kNumRDMARanks);
+        if (is_primary_fwd_init) {
+            int dst_rank = subthread_id * NUM_ESL_PEERS + esl_rank;
+            if (dst_rank != rank) {
+                prim.init_rdma(&prims[channel_id * 2], rank, dst_rank, channel_id * 2, reinterpret_cast<uint8_t*>(rdma_buffer_ptr));
+            }
+        }
+    }
+    if (is_rdma_receiver && receiver_id < kNumRDMAReceivers) {
+        int dst_rank = receiver_id * NUM_ESL_PEERS + esl_rank;
+        if (dst_rank != rank) {
+            prim.init_rdma(&prims[channel_id * 2 + 1], rank, dst_rank, channel_id * 2 + 1, reinterpret_cast<uint8_t*>(rdma_buffer_ptr));
+        }
+        if (receiver_id == 0) {
+            bar1.init(kNumRDMAReceivers);
+        }
+    }
+
+    __local__ __valigned__ long long stack_addr;
+    __local__ __valigned__ volatile int fwd_chunk_ready[kNumRDMARanks];
+    __local__ __valigned__ volatile int fwd_chunk_done[kNumRDMARanks * kNumSecondariesPerGroup];
+    __local__ __valigned__ volatile int fwd_secondary_esl_heads[kNumRDMARanks * kNumSecondariesPerGroup * kNumESLRanks];
+
+    if (is_els_rdma_forwarder && subthread_id == 0) {
+        stack_addr = (long long)(&prim_s);
+        prim_shared = &prim_s;
+    }
+    if (is_els_rdma_forwarder && subthread_id < kNumRDMARanks) {
+        fwd_chunk_ready[subthread_id] = 0;
+        for (int s = 0; s < kNumSecondariesPerGroup; ++s) {
+            fwd_chunk_done[subthread_id * kNumSecondariesPerGroup + s] = 0;
+#pragma unroll
+            for (int i = 0; i < kNumESLRanks; ++i) {
+                fwd_secondary_esl_heads[(subthread_id * kNumSecondariesPerGroup + s) * kNumESLRanks + i] = -1;
+            }
+        }
+    }
+    __syncsubthreads();
+    if (is_els_rdma_forwarder && subthread_id > 0) {
+        prim_shared = (Prim<NUM_ESL_PEERS, kNumRDMARanks, true> *)*(volatile long long *)(&stack_addr);
+    }
+
+    tops::private_dte dte;
+    dte.init();
+    tops::event event;
+    uint8_t *buffer_ptr = esl_buffers[esl_rank];
+
+    // -------------------Combine SymBufferView 划分 -------------------
+    auto esl_channel_x = SymBufferView<uint8_t>(
+                            buffer_ptr, num_max_esl_chunked_recv_tokens * num_bytes_per_token, NUM_ESL_PEERS, num_channels, channel_id);
+
+    auto esl_channel_head = SymBufferView<int>(
+                            buffer_ptr, kNumRDMARanks, NUM_ESL_PEERS, num_channels, channel_id);
+    auto esl_channel_tail = SymBufferView<int>(
+                            buffer_ptr, kNumRDMARanks, NUM_ESL_PEERS, num_channels, channel_id);
+    
+    auto rdma_channel_data = SymBufferView<uint8_t>(
+                            rdma_buffer_combine, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, num_channels, channel_id);
+    auto rdma_channel_head = SymBufferView<int>(
+                            rdma_buffer_combine, 1, kNumRDMARanks, num_channels, channel_id);
+    auto rdma_channel_tail = SymBufferView<int>(
+                            rdma_buffer_combine, 1, kNumRDMARanks, num_channels, channel_id);
+    auto cache_rdma_head = SymBufferView<int>(rdma_buffer_combine, kNumRDMAReceivers, kNumRDMARanks, num_channels, channel_id);
+    auto rdma_channel_barrier_buffer = SymBufferView<int>(rdma_buffer_combine, 1, kNumRDMARanks, num_channels, channel_id);
+    int esl_clean_cache_int_num = (esl_channel_x.total_bytes + esl_channel_head.total_bytes +
+                                    esl_channel_tail.total_bytes) / sizeof(int);
+    int rdma_clean_cache_int_num = (rdma_channel_data.total_bytes + rdma_channel_head.total_bytes +
+                                     rdma_channel_tail.total_bytes + cache_rdma_head.total_bytes +
+                                     rdma_channel_barrier_buffer.total_bytes) / sizeof(int);
+
+
+    if (is_esl_sender && subthread_id < NUM_ESL_PEERS) {
+        int dst_esl_rank = static_cast<int>(subthread_id);
+
+        volatile int token_start_idx_buffer[kNumRDMARanks] = {0};
+        volatile int token_end_idx_buffer[kNumRDMARanks] = {0};
+        int *esl_head_buffer = esl_channel_head.recv_buffer(dst_esl_rank);
+        int *esl_tail_send_buffer = (dst_esl_rank == esl_rank ? esl_channel_tail.recv_buffer(esl_rank)
+                                                                         : esl_channel_tail.send_buffer(dst_esl_rank));
+        uint8_t *data_send_buffer = (dst_esl_rank == esl_rank ? esl_channel_x.recv_buffer(esl_rank)
+                                                                : esl_channel_x.send_buffer(dst_esl_rank));
+        // 遍历获取每个rdma需要发送的token_start_idx和token_end_idx。
+        for (int rdma_idx = 0; rdma_idx < kNumRDMARanks; rdma_idx++) {
+            int prefix_idx = (rdma_idx * NUM_ESL_PEERS + dst_esl_rank) * num_channels + channel_id;
+            token_start_idx_buffer[rdma_idx] = gbl_channel_prefix_matrix[prefix_idx];
+            token_end_idx_buffer[rdma_idx] =
+                (prefix_idx == num_channels * num_ranks - 1) ? num_tokens : gbl_channel_prefix_matrix[prefix_idx + 1];
+        }
+
+        // 主循环：持续处理 token 直到所有 token 都完成
+        uint64_t combine_sender_loop_start = tops::clock64();
+        bool combine_sender_loop_timed_out_printed = false;
+        uint32_t combine_sender_loop_spins = 0;
+        while (true) {
+            if (!combine_sender_loop_timed_out_printed &&
+                ((combine_sender_loop_spins++ & (kCombineTimeoutCheckInterval - 1)) == 0) &&
+                (tops::clock64() - combine_sender_loop_start > kCombineTimeoutCycles)) {
+                for (int rdma_idx = 0; rdma_idx < kNumRDMARanks; rdma_idx++) {
+                    int num_used_slots = *((volatile int*)(esl_tail_send_buffer + rdma_idx)) - *((volatile int*)(esl_head_buffer + rdma_idx));
+                    int num_free_slots = num_max_esl_chunked_recv_tokens_per_rdma - num_used_slots;
+                    printf("esl_tail_send_buffer: %d, esl_head_buffer: %d, rdma_idx: %d, num_free_slots: %d, num_used_slots: %d\n", *((volatile int*)(esl_tail_send_buffer + rdma_idx)), *((volatile int*)(esl_head_buffer + rdma_idx)), rdma_idx, num_free_slots, num_used_slots);
+                }
+                // Print once; this loop usually makes progress, so avoid spamming.
+                printf("[combine][timeup>20s][ESLSender main] rank=%d sm_id=%d channel=%d subthread_id=%d"
+                       "rdma_rank=%d esl_rank=%d dst_esl_rank=%d token0=%d/%d\n",
+                       rank, sm_id, channel_id, subthread_id,
+                       rdma_rank, esl_rank, dst_esl_rank,
+                       token_start_idx_buffer[0], token_end_idx_buffer[0]);
+                combine_sender_loop_timed_out_printed = true;
+            }
+            // 检查是否可以退出循环
+            bool can_exit = true;
+            for (int rdma_idx = 0; rdma_idx < kNumRDMARanks; rdma_idx++) {
+                if (token_start_idx_buffer[rdma_idx] < token_end_idx_buffer[rdma_idx]) {
+                    can_exit = false;
+                    break;
+                }
+            }
+            if (can_exit) {
+                break;
+            }
+            // 遍历所有rdma rank，发送数据
+            for (int rdma_idx = 0; rdma_idx < kNumRDMARanks; rdma_idx++) {
+                int num_used_slots = *((volatile int*)(esl_tail_send_buffer + rdma_idx)) - *((volatile int*)(esl_head_buffer + rdma_idx));
+                int num_free_slots = num_max_esl_chunked_recv_tokens_per_rdma - num_used_slots;
+
+                if (token_start_idx_buffer[rdma_idx] >= token_end_idx_buffer[rdma_idx] ||
+                    num_free_slots < num_max_esl_chunked_send_tokens) {
+                    // 条件 1: token_start_idx < token_end_idx（还有待处理的 token）
+                    // 条件 2: 冲区剩余空间 >= 要发送的 token 数量
+                    continue;
+                }
+
+                int token_idx = token_start_idx_buffer[rdma_idx];
+                int token_end_idx = token_end_idx_buffer[rdma_idx];
+                int num_tokens_to_send = token_end_idx - token_idx;
+                int num_tokens_in_chunk = tcle::min(num_tokens_to_send, num_max_esl_chunked_send_tokens);
+                int dst_slot_idx = 0;
+                // Batch ESL doorbell/wait to reduce per-token control overhead.
+                // Most chunks flush once; large chunks may flush early to avoid SQ credit overflow.
+                constexpr int kEslMaxPostsPerFlush = MAX_ROCE_SQELEM_NUM / 2;
+                int pending_esl_posts = 0;
+                
+                int cached_channel_tail_idx = *((volatile int*)(esl_tail_send_buffer + rdma_idx));
+                if (num_tokens_in_chunk > 0) {
+                    // Stage-1 software ping-pong: single DTE engine, overlap next copy with current ESL send.
+                    dst_slot_idx = cached_channel_tail_idx++ % num_max_esl_chunked_recv_tokens_per_rdma;
+                    dst_slot_idx = rdma_idx * num_max_esl_chunked_recv_tokens_per_rdma + dst_slot_idx;
+                    uint8_t* cur_shifted_x_buffers = esl_channel_x.recv_buffer(esl_rank) + dst_slot_idx * num_bytes_per_token;
+                    uint8_t* cur_x_this_token = (uint8_t*)(x) + token_idx * hidden_bytes;
+                    uint8_t* cur_send_buffer = data_send_buffer + dst_slot_idx * num_bytes_per_token;
+
+                    dte.config_memcpy(tops::mdspan(tops::Global, cur_send_buffer, hidden_bytes),
+                                      tops::mdspan(tops::Global, cur_x_this_token, hidden_bytes));
+                    event = dte.trigger();
+                    uint8_t* cur_p = cur_send_buffer + hidden_bytes;
+                    if (num_topk > 0) {
+                        tcle::set_vl(sizeof(SourceMeta));
+                        auto v_src_meta = tcle::load<__vector char>((char*)(src_meta + token_idx));
+                        tcle::store(v_src_meta, cur_p);
+                        cur_p += sizeof(SourceMeta);
+
+                        tcle::set_vl(num_topk);
+                        auto v_topk_weights = tcle::load<__vector float>((float*)(topk_weights + token_idx * num_topk));
+                        tcle::store(v_topk_weights, (float*)cur_p);
+                    }
+
+                    for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
+                        event.wait();
+
+                        const bool has_next = (chunk_idx + 1) < num_tokens_in_chunk;
+                        uint8_t* next_shifted_x_buffers = nullptr;
+                        uint8_t* next_send_buffer = nullptr;
+                        if (has_next) {
+                            const int next_token_idx = token_idx + 1;
+                            int next_slot_idx = cached_channel_tail_idx++ % num_max_esl_chunked_recv_tokens_per_rdma;
+                            next_slot_idx = rdma_idx * num_max_esl_chunked_recv_tokens_per_rdma + next_slot_idx;
+                            next_shifted_x_buffers = esl_channel_x.recv_buffer(esl_rank) + next_slot_idx * num_bytes_per_token;
+                            uint8_t* next_x_this_token = (uint8_t*)(x) + next_token_idx * hidden_bytes;
+                            next_send_buffer = data_send_buffer + next_slot_idx * num_bytes_per_token;
+
+                            dte.config_memcpy(tops::mdspan(tops::Global, next_send_buffer, hidden_bytes),
+                                              tops::mdspan(tops::Global, next_x_this_token, hidden_bytes));
+                            event = dte.trigger();
+                            uint8_t* next_p = next_send_buffer + hidden_bytes;
+                            if (num_topk > 0) {
+                                tcle::set_vl(sizeof(SourceMeta));
+                                auto v_src_meta = tcle::load<__vector char>((char*)(src_meta + next_token_idx));
+                                tcle::store(v_src_meta, next_p);
+                                next_p += sizeof(SourceMeta);
+
+                                tcle::set_vl(num_topk);
+                                auto v_topk_weights =
+                                    tcle::load<__vector float>((float*)(topk_weights + next_token_idx * num_topk));
+                                tcle::store(v_topk_weights, (float*)next_p);
+                            }
+                        }
+
+                        if (dst_esl_rank != esl_rank) {
+                            prim.send_esl(cur_shifted_x_buffers, cur_send_buffer, dst_esl_rank, num_bytes_per_token);
+                            pending_esl_posts++;
+                            if (pending_esl_posts >= kEslMaxPostsPerFlush) {
+                                prim.ring_doorbell(dst_esl_rank);
+                                prim.wait_esl_trans_done(dst_esl_rank);
+                                prim.unfinished_[dst_esl_rank] = 0;
+                                pending_esl_posts = 0;
+                            }
+                        }
+
+                        if (has_next) {
+                            cur_shifted_x_buffers = next_shifted_x_buffers;
+                            cur_send_buffer = next_send_buffer;
+                        }
+                    }
+                }
+                tcle::fence<L3_MEM_STORE>();
+                esl_tail_send_buffer[rdma_idx] = cached_channel_tail_idx;
+
+                token_start_idx_buffer[rdma_idx] = token_idx;
+                tcle::fence<L3_MEM_STORE>();
+                if (dst_esl_rank != esl_rank){
+                    prim.send_esl(esl_channel_tail.recv_buffer(esl_rank) + rdma_idx,
+                                    esl_tail_send_buffer + rdma_idx, dst_esl_rank, 1);
+                    pending_esl_posts++;
+                    if (pending_esl_posts > 0) {
+                        prim.ring_doorbell(dst_esl_rank);
+                        prim.wait_esl_trans_done(dst_esl_rank);
+                        prim.unfinished_[dst_esl_rank] = 0;
+                        pending_esl_posts = 0;
+                    }
+                }
+            }
+        }
+        // __syncsubthreads();
+    } 
+    if (is_els_rdma_forwarder) {
+        const auto dst_rdma_rank = subthread_id % kNumRDMARanks;
+        const int forwarder_local_id = subthread_id / kNumRDMARanks;
+        const bool is_primary_forwarder = (forwarder_local_id == 0);
+
+        uint8_t* send_buffer = (dst_rdma_rank == rdma_rank ? rdma_channel_data.recv_buffer(dst_rdma_rank)
+                                                            : rdma_channel_data.send_buffer(dst_rdma_rank));
+
+        int num_tokens_to_combine = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
+        int num_tokens_prefix =
+            channel_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
+        num_tokens_to_combine -= num_tokens_prefix;
+        num_tokens_prefix += dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
+
+        combined_esl_head += num_tokens_prefix * NUM_MAX_NVL_PEERS;
+        int last_sent_esl_head[NUM_ESL_PEERS];
+        int accumulated_esl_head[NUM_ESL_PEERS];
+#pragma unroll
+        for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+            last_sent_esl_head[i] = -1;
+            accumulated_esl_head[i] = -1;
+        }
+
+        const int fwd_chunk_size = num_max_rdma_chunked_send_tokens;
+        int chunk_iter = 0;
+        for (int token_start_idx = 0; token_start_idx < num_tokens_to_combine;
+                token_start_idx += fwd_chunk_size) {
+            chunk_iter++;
+            int token_end_idx = std::min(token_start_idx + fwd_chunk_size, num_tokens_to_combine);
+            int num_chunked_tokens = token_end_idx - token_start_idx;
+            int chunk_max_esl_head[NUM_ESL_PEERS];
+#pragma unroll
+            for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+                chunk_max_esl_head[i] = -1;
+            }
+            // Primary: wait for RDMA ring space, then signal secondaries
+            if (is_primary_forwarder) {
+                int rdma_channel_head_val = 0;
+                uint64_t wait_rdma_space_start = tops::clock64();
+                bool wait_rdma_space_timed_out_printed = false;
+                uint32_t wait_rdma_space_spins = 0;
+                while (true) {
+                    rdma_channel_head_val = *(volatile int*)rdma_channel_head.recv_buffer(dst_rdma_rank);
+                    if (!wait_rdma_space_timed_out_printed &&
+                        ((wait_rdma_space_spins++ & (kCombineTimeoutCheckInterval - 1)) == 0) &&
+                        (tops::clock64() - wait_rdma_space_start > kCombineTimeoutCycles)) {
+                        const int num_used_slots = token_start_idx - rdma_channel_head_val;
+                        printf("[combine][timeup>20s][Forwarder wait rdma space] rank=%d sm_id=%d channel=%d subthread_id=%d "
+                                "dst_rdma_rank=%d token_start=%d token_end=%d num_chunk=%d "
+                                "rdma_head=%d used=%d rdma_capacity=%d\n",
+                                rank, sm_id, channel_id, subthread_id,
+                                dst_rdma_rank, token_start_idx, token_end_idx, num_chunked_tokens,
+                                rdma_channel_head_val, num_used_slots, num_max_rdma_chunked_recv_tokens);
+                        wait_rdma_space_timed_out_printed = true;
+                    }
+                    int num_used_slots = token_start_idx - rdma_channel_head_val;
+                    if (num_max_rdma_chunked_recv_tokens - num_used_slots >= num_chunked_tokens) {
+                        break;
+                    }
+                }
+                if (kForwarderGroupSize > 1) {
+                    tcle::fence<L3_MEM_STORE>();
+                    fwd_chunk_ready[dst_rdma_rank] = chunk_iter;
+                }
+            }
+            if (!is_primary_forwarder && kForwarderGroupSize > 1) {
+                while (fwd_chunk_ready[dst_rdma_rank] < chunk_iter) {}
+            }
+            // All forwarders (primary + secondaries) process tokens with stride
+            for (int token_idx = token_start_idx + forwarder_local_id;
+                 token_idx < token_end_idx;
+                 token_idx += kForwarderGroupSize) {
+                auto rdma_slot_idx = token_idx % num_max_rdma_chunked_recv_tokens;
+                uint8_t* shifted = send_buffer + rdma_slot_idx * num_bytes_per_token;
+                uint8_t* all_source_ptrs[NUM_ESL_PEERS];
+                int num_sources = 0;
+
+                for (int esl_idx = 0; esl_idx < NUM_ESL_PEERS; esl_idx++) {
+                    volatile int expected_head = -1;
+                    expected_head = *(volatile int*)(combined_esl_head + token_idx * NUM_MAX_NVL_PEERS + esl_idx);
+                    if (expected_head < 0) {
+                        continue;
+                    }
+                    int staged_esl_head = expected_head;
+                    chunk_max_esl_head[esl_idx] = tcle::max(chunk_max_esl_head[esl_idx], staged_esl_head);
+
+                    int cached_esl_channel_tail_idx = 0;
+                    uint64_t wait_esl_tail_start = tops::clock64();
+                    bool wait_esl_tail_timed_out_printed = false;
+                    uint32_t wait_esl_tail_spins = 0;
+                    while (cached_esl_channel_tail_idx <= expected_head) {
+                        if (!wait_esl_tail_timed_out_printed &&
+                            ((wait_esl_tail_spins++ & (kCombineTimeoutCheckInterval - 1)) == 0) &&
+                            (tops::clock64() - wait_esl_tail_start > kCombineTimeoutCycles)) {
+                            printf("[combine][timeup>20s][Forwarder wait esl tail] rank=%d sm_id=%d channel=%d subthread_id=%d "
+                                    "dst_rdma_rank=%d token_idx=%d esl_idx=%d expected_head=%d cached_tail=%d\n",
+                                    rank, sm_id, channel_id, subthread_id,
+                                    dst_rdma_rank, token_idx, esl_idx, expected_head, cached_esl_channel_tail_idx);
+                            wait_esl_tail_timed_out_printed = true;
+                        }
+                        cached_esl_channel_tail_idx = *(volatile int*)(esl_channel_tail.recv_buffer(esl_idx) + dst_rdma_rank);
+                    }
+
+                    int slot_idx = expected_head % num_max_esl_chunked_recv_tokens_per_rdma;
+                    uint8_t* esl_combine_token_ptr = esl_channel_x.recv_buffer(esl_idx) + (dst_rdma_rank * num_max_esl_chunked_recv_tokens_per_rdma + slot_idx) * num_bytes_per_token;
+                    all_source_ptrs[num_sources++] = esl_combine_token_ptr;
+                }
+
+                if (num_sources == 0) {
+                    continue;
+                }
+                tcle::set_vl(512);
+                for (int vec_idx = 0; vec_idx < (hidden / 512); vec_idx++) {
+                    auto acc = tcle::load<__vector2 __bf16>(
+                        reinterpret_cast<__bf16*>(all_source_ptrs[0]) + vec_idx * 512);
+                    for (int s = 1; s < num_sources; s++) {
+                        acc += tcle::load<__vector2 __bf16>(
+                            reinterpret_cast<__bf16*>(all_source_ptrs[s]) + vec_idx * 512);
+                    }
+                    *reinterpret_cast<__vector2 __bf16*>(
+                        (tops::__ef_bfloat16*)(shifted) + vec_idx * 512) = acc;
+                }
+                {
+                    tcle::set_vl(sizeof(SourceMeta));
+                    auto v_meta = tcle::load<__vector char>(
+                        (char*)(all_source_ptrs[0] + hidden_bytes));
+                    tcle::store(v_meta, (char*)(shifted + hidden_bytes));
+                }
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    auto acc_w = tcle::load<__vector float>(
+                        (float*)(all_source_ptrs[0] + hidden_bytes + sizeof(SourceMeta)));
+                    for (int s = 1; s < num_sources; s++) {
+                        acc_w += tcle::load<__vector float>(
+                            (float*)(all_source_ptrs[s] + hidden_bytes + sizeof(SourceMeta)));
+                    }
+                    tcle::store(acc_w, (float*)(shifted + hidden_bytes + sizeof(SourceMeta)));
+                }
+            }
+            // Secondary: write chunk_max_esl_head to shared memory and signal completion
+            if (!is_primary_forwarder && kForwarderGroupSize > 1) {
+                const int secondary_idx = forwarder_local_id - 1;
+                const int sec_slot = dst_rdma_rank * kNumSecondariesPerGroup + secondary_idx;
+#pragma unroll
+                for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+                    fwd_secondary_esl_heads[sec_slot * kNumESLRanks + i] = chunk_max_esl_head[i];
+                }
+                tcle::fence<L3_MEM_STORE>();
+                fwd_chunk_done[sec_slot] = chunk_iter;
+            }
+            // Primary: wait for secondaries, merge ESL heads, RDMA send, then ESL head update
+            if (is_primary_forwarder) {
+                if (kForwarderGroupSize > 1) {
+                    for (int s = 0; s < kForwarderGroupSize - 1; ++s) {
+                        while (fwd_chunk_done[dst_rdma_rank * kNumSecondariesPerGroup + s] < chunk_iter) {}
+                    }
+                    for (int s = 0; s < kForwarderGroupSize - 1; ++s) {
+                        const int sec_base = (dst_rdma_rank * kNumSecondariesPerGroup + s) * kNumESLRanks;
+#pragma unroll
+                        for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+                            chunk_max_esl_head[i] = tcle::max(chunk_max_esl_head[i],
+                                (int)fwd_secondary_esl_heads[sec_base + i]);
+                        }
+                    }
+                }
+                // RDMA send FIRST (unblocks Receiver sooner)
+                if (dst_rdma_rank != rdma_rank) {
+                    auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
+                    const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_token;
+                    uint8_t* dst_ptr = rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_token;
+                    uint8_t* src_ptr = rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
+                    *(volatile int*)(rdma_channel_tail.send_buffer(dst_rdma_rank)) += num_chunked_tokens;
+                    tcle::fence<L3_MEM_STORE>();
+                    prim.send_rdma(dst_ptr, src_ptr, dst_rdma_rank, num_bytes_per_msg, false);
+                    prim.send_rdma(rdma_channel_tail.recv_buffer(rdma_rank),
+                                                rdma_channel_tail.send_buffer(dst_rdma_rank), dst_rdma_rank, 1, false);
+                    prim.ring_doorbell_rdma();
+                } else {
+                    *(volatile int*)(rdma_channel_tail.recv_buffer(rdma_rank)) += num_chunked_tokens;
+                }
+                // Accumulate ESL heads across chunks, send every 2 chunks to reduce overhead.
+#pragma unroll
+                for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+                    accumulated_esl_head[i] = tcle::max(accumulated_esl_head[i], chunk_max_esl_head[i]);
+                }
+                const bool is_last_chunk = (token_end_idx >= num_tokens_to_combine);
+                if ((chunk_iter & 1) == 0 || is_last_chunk) {
+                    int* dst_head_ptr_base = esl_channel_head.recv_buffer(esl_rank) + dst_rdma_rank;
+                    for (int esl_idx = 0; esl_idx < NUM_ESL_PEERS; ++esl_idx) {
+                        int head_val = accumulated_esl_head[esl_idx];
+                        if (head_val < 0) continue;
+                        if (head_val <= last_sent_esl_head[esl_idx]) continue;
+                        if (esl_idx == esl_rank) {
+                            *dst_head_ptr_base = head_val;
+                        } else {
+                            int* src_head_ptr = esl_channel_head.send_buffer(esl_idx) + dst_rdma_rank;
+                            *src_head_ptr = head_val;
+                            prim_shared->send_esl_and_ring(dst_head_ptr_base, 
+                                                           src_head_ptr,
+                                                           esl_idx, 1, subthread_id);
+                        }
+                        last_sent_esl_head[esl_idx] = head_val;
+                    }
+                    // Reset accumulator after send
+#pragma unroll
+                    for (int i = 0; i < NUM_ESL_PEERS; ++i) {
+                        accumulated_esl_head[i] = -1;
+                    }
+                }
+            }
+        }
+    }
+    if (is_rdma_receiver && receiver_id < kNumRDMAReceivers) {
+        int dst_rdma_rank = receiver_id;
+        int dst_rank = dst_rdma_rank * NUM_ESL_PEERS + esl_rank;
+        int last_sent_rdma_head = -1;
+        int last_written_cache_rdma_head[kNumRDMARanks];
+#pragma unroll
+        for (int i = 0; i < kNumRDMARanks; ++i) {
+            last_written_cache_rdma_head[i] = -1;
+        }
+        int token_start_idx, token_end_idx;
+        get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+
+        // ========== 迭代处理所有 token 并归约 ==========
+        int _recv_processed = 0;
+        for (int token_idx = token_start_idx + receiver_id; token_idx < token_end_idx; token_idx += kNumRDMAReceivers) {
+            uint8_t* all_rdma_source_ptrs[kNumRDMARanks];
+            int num_rdma_sources = 0;
+            tops::__ef_bfloat16* combine_token_ptr = combined_x + token_idx * hidden;
+            float* combined_topk_weights_ptr = combined_topk_weights + token_idx * num_topk;
+            for (int rdma_idx = 0; rdma_idx < kNumRDMARanks; rdma_idx++) {
+                volatile int expected_head = -1;
+                volatile int cached_channel_tail_idx = 0;
+                expected_head = *((volatile int*)(combined_rdma_head + token_idx * kNumRDMARanks + rdma_idx));
+                if (expected_head < 0){
+                    continue;
+                }
+                int staged_rdma_head = expected_head;
+                if (staged_rdma_head > last_written_cache_rdma_head[rdma_idx]) {
+                    *(cache_rdma_head.send_buffer(rdma_idx) + receiver_id) = staged_rdma_head;
+                    last_written_cache_rdma_head[rdma_idx] = staged_rdma_head;
+                }
+                uint64_t wait_rdma_tail_start = tops::clock64();
+                bool wait_rdma_tail_timed_out_printed = false;
+                uint32_t wait_rdma_tail_spins = 0;
+                while (cached_channel_tail_idx <= expected_head) {
+                    const bool should_update_rdma_head =
+                        ((wait_rdma_tail_spins & (kCombineHeadUpdateInterval - 1)) == 0);
+                    const bool should_check_wait_timeout =
+                        ((wait_rdma_tail_spins & (kCombineTimeoutCheckInterval - 1)) == 0);
+                    wait_rdma_tail_spins++;
+
+                    if (should_update_rdma_head && rdma_idx == dst_rdma_rank) {
+                        int min_head = *(volatile int*)(cache_rdma_head.send_buffer(dst_rdma_rank));
+                        for (int r_id = 1; r_id < kNumRDMAReceivers; r_id++) {
+                            min_head = tcle::min(min_head, *(volatile int*)(cache_rdma_head.send_buffer(dst_rdma_rank) + r_id));
+                        }
+                        if (min_head > 0 && min_head > last_sent_rdma_head) {
+                            if (dst_rdma_rank == rdma_rank) {
+                                *(volatile int*)(rdma_channel_head.recv_buffer(rdma_rank)) = min_head;
+                            } else {
+                                *(volatile int*)(rdma_channel_head.send_buffer(dst_rdma_rank)) = min_head;
+                                tcle::fence<L3_MEM_STORE>();
+                                prim.send_rdma(
+                                    rdma_channel_head.recv_buffer(rdma_rank),
+                                    rdma_channel_head.send_buffer(dst_rdma_rank),
+                                    dst_rank, 1, false);
+                                prim.ring_doorbell_rdma();
+                            }
+                            last_sent_rdma_head = min_head;
+                        }
+                    }
+                    if (!wait_rdma_tail_timed_out_printed &&
+                        should_check_wait_timeout &&
+                        (tops::clock64() - wait_rdma_tail_start > kCombineTimeoutCycles)) {
+                        printf("[combine][timeup>20s][RDMAReceiver wait rdma tail] rank=%d sm_id=%d channel=%d receiver_id=%d "
+                                "token_idx=%d rdma_idx=%d expected_head=%d cached_tail=%d\n",
+                                rank, sm_id, channel_id, receiver_id,
+                                token_idx, rdma_idx, expected_head, cached_channel_tail_idx);
+                        wait_rdma_tail_timed_out_printed = true;
+                    }
+                    cached_channel_tail_idx = *(volatile int*)(rdma_channel_tail.recv_buffer(rdma_idx));
+                }
+                int rdma_slot_idx = expected_head % num_max_rdma_chunked_recv_tokens;
+                uint8_t* rdma_combine_token_ptr = rdma_channel_data.recv_buffer(rdma_idx) + rdma_slot_idx * num_bytes_per_token;
+                all_rdma_source_ptrs[num_rdma_sources++] = rdma_combine_token_ptr;
+            }
+
+            if (num_rdma_sources == 0) {
+                continue;
+            }
+            if (num_rdma_sources == 1) {
+                dte.config_memcpy(
+                    tops::mdspan(tops::Global, (uint8_t*)combine_token_ptr, hidden_bytes),
+                    tops::mdspan(tops::Global, all_rdma_source_ptrs[0], hidden_bytes));
+                event = dte.trigger();
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    auto v_w = tcle::load<__vector float>(
+                        (float*)(all_rdma_source_ptrs[0] + hidden_bytes + sizeof(SourceMeta)));
+                    tcle::store(v_w, combined_topk_weights_ptr);
+                }
+                event.wait();
+            } else {
+                tcle::set_vl(512);
+                for (int vec_idx = 0; vec_idx < (hidden / 512); vec_idx++) {
+                    auto acc = tcle::load<__vector2 __bf16>(
+                        reinterpret_cast<__bf16*>(all_rdma_source_ptrs[0]) + vec_idx * 512);
+                    for (int s = 1; s < num_rdma_sources; s++) {
+                        acc += tcle::load<__vector2 __bf16>(
+                            reinterpret_cast<__bf16*>(all_rdma_source_ptrs[s]) + vec_idx * 512);
+                    }
+                    *reinterpret_cast<__vector2 __bf16*>(
+                        static_cast<tops::__ef_bfloat16*>(combine_token_ptr) + vec_idx * 512) = acc;
+                }
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    auto acc_w = tcle::load<__vector float>(
+                        (float*)(all_rdma_source_ptrs[0] + hidden_bytes + sizeof(SourceMeta)));
+                    for (int s = 1; s < num_rdma_sources; s++) {
+                        acc_w += tcle::load<__vector float>(
+                            (float*)(all_rdma_source_ptrs[s] + hidden_bytes + sizeof(SourceMeta)));
+                    }
+                    tcle::store(acc_w, combined_topk_weights_ptr);
+                }
+            }
+            _recv_processed++;
+            if ((_recv_processed & (kRecvHeadSendStep - 1)) == 0) {
+                int min_head = *(volatile int*)(cache_rdma_head.send_buffer(dst_rdma_rank));
+                for (int r_id = 1; r_id < kNumRDMAReceivers; r_id++) {
+                    min_head = tcle::min(min_head, *(volatile int*)(cache_rdma_head.send_buffer(dst_rdma_rank) + r_id));
+                }
+                if (min_head > 0 && min_head > last_sent_rdma_head) {
+                    if (dst_rdma_rank == rdma_rank) {
+                        *(volatile int*)(rdma_channel_head.recv_buffer(rdma_rank)) = min_head;
+                    } else {
+                        *(volatile int*)(rdma_channel_head.send_buffer(dst_rdma_rank)) = min_head;
+                        tcle::fence<L3_MEM_STORE>();
+                        prim.send_rdma(
+                            rdma_channel_head.recv_buffer(rdma_rank),
+                            rdma_channel_head.send_buffer(dst_rdma_rank),
+                            dst_rank, 1, false);
+                        prim.ring_doorbell_rdma();
+                    }
+                    last_sent_rdma_head = min_head;
+                }
+            }
+        }
+        bar1.arrive_and_wait();
+        // send rdma_channel_head to dst_rdma_rank
+        int min_head = *(volatile int*)(cache_rdma_head.send_buffer(dst_rdma_rank));
+        for (int r_id = 1; r_id < kNumRDMAReceivers; r_id++) {
+            min_head = tcle::min(min_head, *(volatile int*)(cache_rdma_head.send_buffer(dst_rdma_rank) + r_id));
+        }
+        if (min_head > 0 && min_head > last_sent_rdma_head) {
+            if (dst_rdma_rank == rdma_rank) {
+                *(volatile int*)(rdma_channel_head.recv_buffer(rdma_rank)) = min_head;
+            } else {
+                *(volatile int*)(rdma_channel_head.send_buffer(dst_rdma_rank)) = min_head;
+                tcle::fence<L3_MEM_STORE>();
+                prim.send_rdma(
+                    rdma_channel_head.recv_buffer(rdma_rank),
+                    rdma_channel_head.send_buffer(dst_rdma_rank),
+                    dst_rank, 1, false);
+                prim.ring_doorbell_rdma();
+            }
+            last_sent_rdma_head = min_head;
+        }
+    }
+    auto combine_cache_sync = [&]() {
+        tops::sync_grid_threads();
+        // ESL side: synchronize all local cards before/after cleaning ring buffers.
+        if (sm_id == 0) {
+            volatile int *src_flag_ptr =
+                reinterpret_cast<volatile int *>(barrier_signal_ptrs[esl_rank] + esl_rank);
+            *src_flag_ptr = kInternodeSpecialFlag;
+            tcle::fence<L3_MEM_STORE>();
+            if (subthread_id < NUM_ESL_PEERS) {
+                const int dst_esl_rank = subthread_id;
+                const int dst_rank = rdma_rank * NUM_ESL_PEERS + dst_esl_rank;
+                int *dst_flag_ptr = barrier_signal_ptrs[esl_rank] + esl_rank;
+                if (dst_rank != rank) {
+                    prim.send_esl(dst_flag_ptr, (int *)src_flag_ptr, dst_rank, 1);
+                    prim.ring_doorbell(dst_rank);
+                    prim.wait_esl_trans_done(dst_rank);
+                }
+            }
+            __syncsubthreads();
+            if (subthread_id < NUM_ESL_PEERS) {
+                volatile int *my_ptr =
+                    reinterpret_cast<volatile int *>(barrier_signal_ptrs[esl_rank] + subthread_id);
+                while (*my_ptr != kInternodeSpecialFlag) {}
+                *(volatile int *)(barrier_signal_ptrs[esl_rank] + subthread_id) = 0;
+            }
+        }
+
+        tops::sync_grid_threads();
+        // RDMA side: synchronize both RDMA ranks using dedicated barrier slots.
+        if (is_els_rdma_forwarder && channel_id == 0 && subthread_id < kNumRDMARanks) {
+            const int dst_rdma_rank = subthread_id;
+            const int dst_rank = dst_rdma_rank * NUM_ESL_PEERS + esl_rank;
+            volatile int *src_barrier_int_ptrs = rdma_channel_barrier_buffer.send_buffer(dst_rdma_rank);
+            volatile int *dst_barrier_int_ptrs = rdma_channel_barrier_buffer.recv_buffer(rdma_rank);
+            *src_barrier_int_ptrs = kInternodeSpecialFlag;
+            tcle::fence<L3_MEM_STORE>();
+            if (dst_rank != rank) {
+                prim.send_rdma(dst_barrier_int_ptrs, src_barrier_int_ptrs, dst_rank, 1, false, true);
+            } else {
+                *(volatile int*)(rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank)) = kInternodeSpecialFlag;
+            }
+            while (true) {
+                volatile int *my_barrier_int_ptrs = rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank);
+                if (*my_barrier_int_ptrs == kInternodeSpecialFlag) {
+                    *(volatile int*)(rdma_channel_barrier_buffer.recv_buffer(dst_rdma_rank)) = 0;
+                    break;
+                }
+            }
+            *src_barrier_int_ptrs = 0;
+        }
+        tops::sync_grid_threads();
+    };
+
+    combine_cache_sync();
+    // Parallel clean: all SIPs and all subthreads participate.
+    const int sip_num = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int num_subthreads = static_cast<int>(threadDim.x);
+    const int clean_worker_num = sip_num * num_subthreads;
+    const int clean_worker_id = sm_id * num_subthreads + subthread_id;
+
+    __vector int all_zero = (__vector int)(0);
+    auto rdma_buffer_combine_clean_int = static_cast<int *>((void*)(rdma_buffer_combine_clean));
+    for (int rdma_clean_offset = clean_worker_id * 128;
+            rdma_clean_offset < rdma_clean_cache_int_num;
+            rdma_clean_offset += clean_worker_num * 128) {
+        int vl_cur = (rdma_clean_cache_int_num - rdma_clean_offset) < 128
+                   ? rdma_clean_cache_int_num - rdma_clean_offset
+                   : 128;
+        tcle::set_vl(vl_cur);
+        tcle::store(all_zero, rdma_buffer_combine_clean_int + rdma_clean_offset);
+    }
+    auto esl_buffer_ptr_int = static_cast<int*>((void*)(esl_buffer_combine_clean));
+    for (int esl_clean_offset = clean_worker_id * 128;
+            esl_clean_offset < esl_clean_cache_int_num;
+            esl_clean_offset += clean_worker_num * 128) {
+        int vl_cur = (esl_clean_cache_int_num - esl_clean_offset) < 128
+                   ? esl_clean_cache_int_num - esl_clean_offset
+                   : 128;
+        tcle::set_vl(vl_cur);
+        tcle::store(all_zero, esl_buffer_ptr_int + esl_clean_offset);
+    }
+}
+
+void combine(int type,
+             void* combined_x, float* combined_topk_weights,
+             const bool* is_combined_token_in_rank,
+             const void* x, const float* topk_weights,
+             const void* bias_0, const void* bias_1,
+             const int* combined_rdma_head, const int* combined_nvl_head,
+             const void* src_meta, const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, const int* gbl_channel_prefix_matrix,
+             int num_tokens, int num_combined_tokens, int hidden, int num_topk,
+             void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
+             void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
+             int** barrier_signal_ptrs, int rank, int num_ranks, int num_nvl_ranks, topsStream_t stream, int num_channels, bool low_latency_mode, struct primitives* prims) {
+            int num_rdma_ranks = num_ranks / num_nvl_ranks;
+    EP_HOST_ASSERT(num_nvl_ranks <= 8);
+
+#define COMBINE_LAUNCH_CASE(num_esl_ranks, num_rdma_ranks) { \
+    auto kernel = combine<num_esl_ranks, num_rdma_ranks>; \
+    LAUNCH_KERNEL(&cfg, kernel, \
+        reinterpret_cast<tops::__ef_bfloat16*>(combined_x), combined_topk_weights, \
+        is_combined_token_in_rank, \
+        reinterpret_cast<const tops::__ef_bfloat16*>(x), topk_weights, \
+        reinterpret_cast<const tops::__ef_bfloat16*>(bias_0), reinterpret_cast<const tops::__ef_bfloat16*>(bias_1), \
+        combined_rdma_head, combined_nvl_head, \
+        reinterpret_cast<const SourceMeta*>(src_meta), rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, \
+        num_tokens, num_combined_tokens, hidden, num_topk, \
+        rdma_buffer_ptr, num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, \
+        buffer_ptrs, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, \
+        barrier_signal_ptrs, rank, num_ranks, num_channels, prims); \
+    }
+    SETUP_LAUNCH_CONFIG(num_channels, 2, 8, stream);
+
+    ESL_SWITCH(num_nvl_ranks, ESL_RANKS, [&] {
+      RDMA_SWITCH(num_rdma_ranks, RDMA_RANKS, [&] {
+        COMBINE_LAUNCH_CASE(ESL_RANKS, RDMA_RANKS);
+      });
+    });
+#undef COMBINE_LAUNCH_CASE
+}
+
+} // namespace internode
+
+} // namespace deep_ep

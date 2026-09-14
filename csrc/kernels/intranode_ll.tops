@@ -1,0 +1,669 @@
+#include "configs.h"
+#include "exception.h"
+#include "launch.h"
+#include "utils.h"
+#include "lare_gda.h"
+#include "devcomm.h"
+#include <krt/builtins.h>
+#define USE_INST_CPY
+
+namespace deep_ep {
+
+namespace intranode_ll {
+
+template <bool kUseFP8, bool kUseUE8M0, bool kUseExternalScale, int kHidden>
+__global__ /*__launch_bounds__(1024, 1)*/ void
+dispatch(void* packed_recv_x, void* packed_recv_x_scales,
+         int* packed_recv_src_info, int64_t* packed_recv_layout_range,
+         int* packed_recv_count,
+         int* cumulative_local_expert_recv_stats,
+         int64_t* dispatch_wait_recv_cost_stats,
+         void* rdma_recv_x, int* rdma_recv_count, void* rdma_x, void* rdma_buffer_ptr,
+         const void* x, const int64_t* topk_idx,
+         int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
+         int* clean_flag_per_expert,
+         int* num_tokens_per_expert,
+         int* next_clean, int num_next_clean_int,
+         int num_tokens, int num_max_dispatch_tokens_per_rank,
+         int num_topk, int num_experts, int rank, int num_ranks,
+         int num_warp_groups, int num_warps_per_group,
+         const float* fp8_quant_scale, bool round_scale, int phases, struct primitives* prims) {
+
+    // Todo. Theses parameters will be supported later
+    static_cast<void>(cumulative_local_expert_recv_stats);
+    static_cast<void>(dispatch_wait_recv_cost_stats);
+    static_cast<void>(num_warp_groups);
+    static_cast<void>(num_warps_per_group);
+    // Workaround: int64_t is limited to 32 bits on torch_gcu, so we need to cast to int
+    // will be removed when torch_gcu release the limitation
+    int* topk_idx_int = reinterpret_cast<int*>(const_cast<int64_t*>(topk_idx));
+
+    // Get thread and block indices
+    const auto num_sms = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+    const auto subthread_id = static_cast<int>(subThreadIdx.x);
+    const auto num_subthreads = static_cast<int>(threadDim.x);
+    const auto num_local_experts = num_experts / num_ranks;
+    const auto expert_begin_idx = sm_id * num_warp_groups;
+    const auto expert_end_idx = expert_begin_idx + num_warp_groups > num_experts ? num_experts : expert_begin_idx + num_warp_groups;
+    // May extract UE8M0 from the scales
+    using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
+    using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
+    EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
+    // FP8 staffs
+    constexpr int kNumPerChannels = 128;
+    const int num_scales = kHidden / kNumPerChannels;
+    // const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
+    const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(uint8_t) : sizeof(tops::__ef_bfloat16));
+
+    // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
+    // NOTES: currently we have 3 reserved int fields for future use
+    // const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(tops::__ef_bfloat16)));
+    // EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
+
+    // TODO: Optimize memcpyGtoG
+    tops::private_dte engine;
+    engine.init();
+#ifndef USE_INST_CPY
+    dte_engine_async dte_engine;
+#endif
+    EslGdaEngine esl_engine(prims->ibgda_info_ptr, prims->qp_shared_states_ptr, rank, num_ranks);
+    auto scale_storer = ScaleStorer<kUseUE8M0>();
+
+    constexpr int kVectorSize = 128;
+    using IntVT = typename tcle::altivector<int, kVectorSize>::VT;
+    constexpr int kMaxLocalExperts = 256;
+    // tops::pdl_wait();
+    // Sending phase
+    if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
+        goto LOW_LATENCY_DISPATCH_RECV;
+
+    if (subthread_id == num_subthreads - 1) {
+      if (sm_id == num_sms - 1) {
+          auto clean_leaptr = tcle::simple_leaptr<__vector int>(next_clean);
+          for (int i = 0; i < num_next_clean_int; i += 128) {
+              tcle::set_vl(std::min(128, num_next_clean_int - i));
+              clean_leaptr.store((__vector int)(0));
+          }
+          tcle::set_vl(512);
+          for (int i = 0; i < num_experts; i += 128) {
+            using MT = typename tcle::altivector_to_mask<__vector int>::type;
+            auto out_mask = tcle::vset_mb<MT>(std::min(num_experts - i, 128));
+            tcle::v_atomic_vadd(atomic_finish_counter_per_expert + i, (__vector int)(FINISHED_SUM_TAG), out_mask);
+          }
+      }
+    }
+
+    // Current sm should be responsible for some destination experts, count for them
+    __local__ __valigned__ int expert_counts[kMaxLocalExperts];
+    if (subthread_id == num_subthreads - 2) {
+      for(int e = 0; e < kMaxLocalExperts; e+= 128) {
+        tcle::store(IntVT(0), expert_counts + e);
+      }
+      using MT = typename tcle::altivector_to_mask<IntVT>::type;
+
+      auto curr_topk_idx_leaptr = tcle::simple_leaptr<IntVT>(topk_idx_int);
+      for (int e = 0; e < num_tokens * num_topk; e+= 128) {
+        auto mb = tcle::vset_mb<MT>(std::min(num_tokens * num_topk - e, 128));
+        auto vt_mask = (IntVT)(-1);
+        auto in = curr_topk_idx_leaptr.load(vt_mask, mb);
+#pragma clang loop unroll(full)
+        for (int k = expert_begin_idx; k < expert_end_idx; k++) {
+          auto mask = in == k;
+          expert_counts[k - expert_begin_idx] += tcle::popc_mb<0>(mask);
+        }
+      }
+
+      for (int k = expert_begin_idx; k < expert_end_idx; k++) {
+          auto total_count = expert_counts[k - expert_begin_idx];
+          num_tokens_per_expert[k] =  -total_count - 1;
+      }
+      auto expert_counts_leaptr = tcle::simple_leaptr<IntVT>(expert_counts);
+      for (int i = expert_begin_idx; i < expert_end_idx; i += 128) {
+        auto mb = tcle::vset_mb<MT>(std::min(expert_end_idx - i, 128));
+        auto count = expert_counts_leaptr.load(IntVT(0), mb);
+        tcle::v_atomic_vadd(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - count, mb);
+      }
+    }
+
+
+    // Send phase code block
+    {
+        const uint64_t expert_stride_bytes = num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
+        const uint64_t rank_offset_bytes = rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
+        const uint64_t rdma_recv_x_base = reinterpret_cast<uint64_t>(rdma_recv_x);
+
+        __vector int cached_topk_vec;
+        int cached_topk_base = -1;
+
+        auto topk_idx_leaptr = tcle::simple_leaptr<IntVT>(topk_idx_int);
+        using TopkMaskT = typename tcle::altivector_to_mask<IntVT>::type;
+
+        for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
+
+            const int topk_base = token_idx * num_topk;
+            // Reload when this token's top-k slice is not fully contained in the cached 128-int chunk.
+            // Required for num_topk not dividing 128 (e.g. num_topk=6); intranode.tops has the same guard.
+            if (num_topk > 0 &&
+                (cached_topk_base < 0 || topk_base + num_topk - 1 >= cached_topk_base + kVectorSize)) {
+                cached_topk_base = topk_base;
+                topk_idx_leaptr.set_address(topk_idx_int + cached_topk_base);
+                const int remaining = num_tokens * num_topk - cached_topk_base;
+                if (remaining < kVectorSize) {
+                    auto mb = tcle::vset_mb<TopkMaskT>(remaining);
+                    cached_topk_vec = topk_idx_leaptr.load((IntVT)(-1), mb);
+                } else {
+                    cached_topk_vec = topk_idx_leaptr.load();
+                }
+            }
+
+            const auto x_bf16 = static_cast<const tops::__ef_bfloat16*>(x) + token_idx * kHidden;
+            const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
+            const int offset_in_vector = topk_base - cached_topk_base;
+
+            if constexpr (kUseFP8) {
+                const auto rdma_x_vec = reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4);
+                const auto rdma_x_scales = reinterpret_cast<float*>(
+                    reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
+
+                if (subthread_id == 0) *rdma_x_src_idx = token_idx;
+
+                if constexpr (kUseExternalScale) {
+                    // fp8_quant_scale is a per-tensor scalar (one value for the whole tensor).
+                    token_quantize_with_external_scale_t<kHidden, kNumPerChannels>(
+                        rdma_x_vec, rdma_x_scales, x_bf16,
+                        fp8_quant_scale[0], subthread_id, num_subthreads);
+                } else {
+                    token_quantize_t<kHidden, kNumPerChannels>(round_scale, rdma_x_vec, rdma_x_scales, x_bf16, subthread_id, num_subthreads);
+                }
+                tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                tops::sync_subthreads();
+            }
+
+                for (int k = subthread_id; k < num_topk; k += num_subthreads) {
+                    auto dst_expert_idx = cached_topk_vec[offset_in_vector + k];
+                    if (dst_expert_idx < 0 || dst_expert_idx >= num_experts) {
+                        continue;
+                    }
+                    const auto dst_rank = dst_expert_idx / num_local_experts;
+                    esl_endpoint qp;
+                    esl_endpoint* qp_ptr = &qp;
+                    const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
+                    int qp_idx = dst_expert_local_idx % esl_engine.get_num_rc_per_pe();
+                    esl_engine.get_qp_fetch(dst_rank, qp_idx);
+#ifdef USE_INST_CPY
+                    auto send_g2g = InstG2G<kUseFP8 ? num_bytes_per_msg : kHidden * sizeof(tops::__ef_bfloat16)>();
+                    if constexpr (kUseFP8) {
+                      send_g2g.fetch(reinterpret_cast<uint8_t*>(rdma_x_src_idx));
+                    } else {
+                      send_g2g.fetch((void*)(x_bf16));
+                    }
+#endif
+                    int slot_idx = tcle::atomic_add(atomic_counter_per_expert + dst_expert_idx, 1);
+                    auto dst_flag_ptr = rdma_recv_x_base +
+                                            dst_expert_local_idx * expert_stride_bytes +
+                                            rank_offset_bytes +
+                                            slot_idx * num_bytes_per_msg;
+                    dst_flag_ptr = prims->rdma_peer_base[dst_rank] + (dst_flag_ptr - (uint64_t)rdma_buffer_ptr);
+                    auto dst_ptr = dst_flag_ptr + sizeof(int4);
+
+                    __valigned__ char tmp_buffer[512];
+                    qp_ptr = (esl_endpoint*)tmp_buffer;
+                    if constexpr (kUseFP8) {
+                        if (dst_rank == rank) {
+#ifdef USE_INST_CPY
+                            send_g2g.store(reinterpret_cast<uint8_t*>(dst_flag_ptr));
+#else
+                            dte_engine.memcpyGtoGx(engine, reinterpret_cast<uint8_t*>(dst_flag_ptr), reinterpret_cast<uint8_t*>(rdma_x_src_idx), (ssize_t)num_bytes_per_msg);
+#endif
+                        } else {
+                            esl_engine.get_qp(qp_ptr);
+                            uint64_t wqe_idx = esl_engine.get_wqe_slots(qp_ptr, 1);
+                            esl_engine.send<NON_ATOMIC_OPERATION, uint8_t>(reinterpret_cast<uint8_t*>(dst_flag_ptr), reinterpret_cast<uint8_t*>(rdma_x_src_idx), qp_ptr, wqe_idx, num_bytes_per_msg, false);
+                            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                            esl_engine.ringDb(qp_ptr, wqe_idx, 1);
+                        }
+                    } else {
+                        if (dst_rank == rank) {
+                            reinterpret_cast<int*>(dst_flag_ptr)[0] = token_idx;
+#ifdef USE_INST_CPY
+                            send_g2g.store(reinterpret_cast<void*>(dst_ptr));
+#else
+                            dte_engine.memcpyGtoGx(engine, reinterpret_cast<tops::__ef_bfloat16*>(dst_ptr), x_bf16, (ssize_t)kHidden);
+#endif
+                        } else {
+                            esl_engine.get_qp(qp_ptr);
+                            uint64_t wqe_idx = esl_engine.get_wqe_slots(qp_ptr, 2);
+                            *rdma_x_src_idx = token_idx;
+                            esl_engine.send<NON_ATOMIC_OPERATION, tops::__ef_bfloat16>(reinterpret_cast<tops::__ef_bfloat16*>(dst_ptr), x_bf16, qp_ptr, wqe_idx, kHidden, false);
+                            esl_engine.send<NON_ATOMIC_OPERATION, int>(reinterpret_cast<int*>(dst_flag_ptr), rdma_x_src_idx, qp_ptr, wqe_idx+1, 1, false);
+                            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                            esl_engine.ringDb(qp_ptr, wqe_idx, 2);
+                        }
+                    }
+                    tcle::atomic_add(atomic_finish_counter_per_expert + dst_expert_idx, 1);
+                }
+            }
+#ifndef USE_INST_CPY
+        dte_engine.wait();
+#endif
+        // wait background thread finish
+        __syncsubthreads();
+
+        // Issue count sends
+        for (int expert_idx = expert_begin_idx + subthread_id; expert_idx < expert_end_idx; expert_idx += num_subthreads) {
+            const auto dst_rank = expert_idx / num_local_experts;
+            const auto dst_expert_local_idx = expert_idx % num_local_experts;
+
+            uint64_t dst_ptr = (uint64_t)(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
+            int qp_idx = dst_expert_local_idx % esl_engine.get_num_rc_per_pe();
+            esl_endpoint qp;
+            esl_endpoint* qp_ptr = &qp;
+            esl_engine.get_qp_fetch(dst_rank, qp_idx);
+            dst_ptr = prims->rdma_peer_base[dst_rank] + (dst_ptr - (uint64_t)rdma_buffer_ptr);
+            volatile int* finish_counter_volatile_ptr = (volatile int*)(atomic_finish_counter_per_expert + expert_idx);
+            while (*finish_counter_volatile_ptr != 2 * FINISHED_SUM_TAG);
+            if (dst_rank == rank) {
+                auto num_tokens_sent = - expert_counts[expert_idx - expert_begin_idx] - 1;
+                reinterpret_cast<volatile int*>(dst_ptr)[0] = num_tokens_sent;
+            } else {
+                __valigned__ char tmp_buffer[512];
+                qp_ptr = (esl_endpoint*)tmp_buffer;
+                esl_engine.get_qp(qp_ptr);
+                uint64_t wqe_idx = esl_engine.get_wqe_slots(qp_ptr, 1);
+                esl_engine.send<NON_ATOMIC_OPERATION, int>(reinterpret_cast<int*>(dst_ptr), num_tokens_per_expert + expert_idx, qp_ptr, wqe_idx, 1, true);
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                esl_engine.ringDb(qp_ptr, wqe_idx, 1);
+            }
+        }
+
+        // Clean workspace for next use
+        for (int expert_idx = expert_begin_idx + subthread_id; expert_idx < expert_end_idx; expert_idx += num_subthreads) {
+            atomic_counter_per_expert[expert_idx] = 0;
+            atomic_finish_counter_per_expert[expert_idx] = 0;
+            clean_flag_per_expert[expert_idx] = 0;
+        }
+    }  // End of send phase code block
+
+    // Receiving phase
+    LOW_LATENCY_DISPATCH_RECV:
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+        return;
+
+    // Receiving and packing
+    // Each subthread processes different (local_expert, src_rank) combinations
+    // Total combinations: num_local_experts * num_ranks
+    // const int total_recv_tasks = num_local_experts * num_ranks;
+    // const int tasks_per_sm = (total_recv_tasks + num_sms - 1) / num_sms;
+
+    // Precompute constant strides for recv phase
+    const uint64_t recv_expert_stride_bytes = num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
+    const uint64_t recv_rank_stride_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
+    const uint64_t packed_expert_stride_bytes = num_ranks * num_max_dispatch_tokens_per_rank * hidden_bytes;
+    const int src_info_expert_stride = num_ranks * num_max_dispatch_tokens_per_rank;
+#ifdef USE_INST_CPY
+    auto recv_g2g = InstG2G<hidden_bytes>();
+#endif
+    // EP_MAX_RANKS will be replaced with template parameter when we decouple the kernel of superpod and OGX.
+    __local__ __valigned__ int expert_rank_counts[EP_MAX_RANKS];
+    __local__ __valigned__ int expert_rank_offsets[EP_MAX_RANKS];
+
+    for (int local_expert_idx = sm_id; local_expert_idx < num_local_experts; local_expert_idx += num_sms) {
+        for (int src_rank = subthread_id; src_rank < num_ranks; src_rank += num_subthreads) {
+            volatile int* recv_count_volatile_ptr = (volatile int*)(rdma_recv_count + local_expert_idx * num_ranks + src_rank);
+            int num_recv_tokens = 0;
+            while ((num_recv_tokens = *recv_count_volatile_ptr) == 0);
+            num_recv_tokens = -num_recv_tokens - 1;
+            expert_rank_counts[src_rank] = num_recv_tokens;
+        }
+        tcle::fence<tcle::FenceType::L1_VDMEM_STORE>();
+        tops::sync_subthreads();
+
+        if (subthread_id == 0) {
+            int total_recv_count = 0;
+            for (int r = 0; r < num_ranks; ++r) {
+                expert_rank_offsets[r] = total_recv_count;
+                total_recv_count += expert_rank_counts[r];
+            }
+            packed_recv_count[local_expert_idx] = total_recv_count;
+        }
+        tcle::fence<tcle::FenceType::L1_VDMEM_STORE>();
+        tops::sync_subthreads();
+
+        for (int src_rank = subthread_id; src_rank < num_ranks; src_rank += num_subthreads) {
+            int num_recv_tokens = expert_rank_counts[src_rank];
+            int recv_token_begin_idx = expert_rank_offsets[src_rank];
+            const auto rdma_recv_x_uint8 = static_cast<uint8_t*>(rdma_recv_x) +
+                    local_expert_idx * recv_expert_stride_bytes +
+                    src_rank * recv_rank_stride_bytes;
+            const auto recv_x_uint8 = reinterpret_cast<uint8_t*>(packed_recv_x) +
+                    local_expert_idx * packed_expert_stride_bytes;
+            const auto recv_src_info = packed_recv_src_info + local_expert_idx * src_info_expert_stride;
+            const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
+
+            const auto num_aligned_scales = align_up<int>(num_scales, sizeof(float) / sizeof(scale_t));
+            const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
+
+            // Use pack2 to pack count and begin_idx into int64
+            recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
+
+            for (int i = 0; i < num_recv_tokens; ++i) {
+                // Read source info
+                const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
+                auto src_src_idx_value = *src_src_idx;
+                // Copy tokens
+                const auto src_data = reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4);
+                const auto dst_data = reinterpret_cast<uint8_t*>(recv_x_uint8 + (recv_token_begin_idx + i) * hidden_bytes);
+                const auto src_scales = reinterpret_cast<float*>(
+                    reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
+
+                if constexpr (kUseFP8) {
+                  scale_storer.fetch_scale(src_scales, num_scales);
+                }
+#ifdef USE_INST_CPY
+                recv_g2g.fetch(src_data);
+#else
+                tops::event copy_event = tops::memcpy_async(engine,
+                    tops::mdspan(tops::Global, dst_data, static_cast<int>(hidden_bytes)),
+                    tops::mdspan(tops::Global, src_data, static_cast<int>(hidden_bytes)));
+#endif
+
+                recv_src_info[recv_token_begin_idx + i] = src_src_idx_value;
+            // Copy scales (each token's scales follow immediately after its hidden data)
+            if constexpr (kUseFP8) {
+              // num_scales <= 128
+              const int num_elems_per_pack = kUseUE8M0 ? 4 : 1;
+
+              const int pack_stride = num_ranks *
+                                      num_max_dispatch_tokens_per_rank *
+                                      num_elems_per_pack;
+
+              const int token_stride = num_elems_per_pack;
+
+              const int current_token_offset_elems =
+                  (recv_token_begin_idx + i) * token_stride;
+              auto* scatter_base_ptr =
+                  recv_x_scales + current_token_offset_elems;
+
+
+              scale_storer.write_fp8_scales_strided(
+                  scatter_base_ptr, num_scales, pack_stride);
+            }
+#ifdef USE_INST_CPY
+            recv_g2g.store(dst_data);
+#else
+            copy_event.wait();
+#endif
+          }
+        }
+    }
+}
+
+void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
+              int* packed_recv_src_info, int64_t* packed_recv_layout_range,
+              int* packed_recv_count,
+              int* cumulative_local_expert_recv_stats,
+              int64_t* dispatch_wait_recv_cost_stats,
+              void* rdma_recv_x, int* rdma_recv_count, void* rdma_x, void* rdma_buffer_ptr,
+              const void* x, const int64_t* topk_idx,
+              int* next_clean, int num_next_clean_int,
+              int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+              int num_topk, int num_experts, int rank, int num_ranks,
+              bool use_fp8, bool round_scale, bool use_ue8m0,
+              const float* fp8_quant_scale,
+              void* workspace, int* num_tokens_per_expert, int num_device_sms, int max_threads_per_sm,
+              topsStream_t stream, int phases, struct primitives* prims) {
+    // TODO:
+    // 1. Remove num_device_sms hardcode
+    // 2. Optimize thread scheduling
+    // 3. rename some variables to make it more readable for gcu platform
+    const int num_warp_groups = ceil_div(num_experts, num_device_sms * max_threads_per_sm);
+    const int num_warps_per_group = 1;
+    EP_HOST_ASSERT(num_warp_groups > 0);
+
+    // Workspace checks
+    auto atomic_counter_per_expert = static_cast<int*>(workspace);
+    auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
+    auto clean_flag_per_expert = atomic_finish_counter_per_expert + num_experts;
+    EP_HOST_ASSERT(num_experts * sizeof(int) * 3 <= NUM_WORKSPACE_BYTES);
+
+    // FP8 checks
+    if (use_ue8m0)
+    EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
+    if (fp8_quant_scale != nullptr)
+        EP_HOST_ASSERT(use_fp8 and not use_ue8m0 and "fp8_quant_scale requires use_fp8=True and use_ue8m0=False");
+
+#define DISPATCH_LAUNCH_CASE(hidden) { \
+auto dispatch_func = dispatch<false, false, false, hidden>; \
+if (use_fp8 and not use_ue8m0 and fp8_quant_scale == nullptr) \
+    dispatch_func = dispatch<true, false, false, hidden>; \
+if (use_fp8 and use_ue8m0 and fp8_quant_scale == nullptr) \
+    dispatch_func = dispatch<true, true, false, hidden>; \
+if (use_fp8 and fp8_quant_scale != nullptr) \
+    dispatch_func = dispatch<true, false, true, hidden>; \
+LAUNCH_KERNEL(&cfg, dispatch_func, \
+              packed_recv_x, packed_recv_x_scales, \
+              packed_recv_src_info, packed_recv_layout_range, \
+              packed_recv_count, \
+              cumulative_local_expert_recv_stats, \
+              dispatch_wait_recv_cost_stats, \
+              rdma_recv_x, rdma_recv_count, rdma_x, rdma_buffer_ptr, \
+              x, topk_idx, \
+              atomic_counter_per_expert, atomic_finish_counter_per_expert, \
+              clean_flag_per_expert, \
+              num_tokens_per_expert, \
+              next_clean, num_next_clean_int, \
+              num_tokens, num_max_dispatch_tokens_per_rank, \
+              num_topk, num_experts, rank, num_ranks, \
+              num_warp_groups, num_warps_per_group, \
+              fp8_quant_scale, round_scale, phases, prims); } break
+
+    // SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    const int MAX_SUBTHREADS = LOW_LATENCY_DISPATCH_SUBTHREADS;
+    SETUP_LAUNCH_CONFIG(num_device_sms, max_threads_per_sm, MAX_SUBTHREADS, stream);
+    SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
+#undef DISPATCH_LAUNCH_CASE
+}
+
+template <int kHidden>
+__global__ void
+combine(void* combined_x,
+        void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+        const void* x, const int64_t* topk_idx, const float* topk_weights,
+        const int* src_info, const int64_t* layout_range,
+        int64_t* combine_wait_recv_cost_stats,
+        int* next_clean, int num_next_clean_int,
+        int* atomic_clean_flag,
+        int num_combined_tokens, int hidden, int num_topk,
+        int num_max_dispatch_tokens_per_rank,
+        int num_experts, int rank, int num_ranks,
+        int num_warp_groups, int num_warps_per_group,
+        int phases, bool zero_copy, struct primitives* prims, int* cached_value_ptrs, void* rdma_buffer_ptr) {
+    // Todo. Theses parameters will be supported later
+    static_cast<void>(combine_wait_recv_cost_stats);
+    static_cast<void>(num_warp_groups);
+    static_cast<void>(num_warps_per_group);
+    const auto num_sms = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+    const auto subthread_id = static_cast<int>(subThreadIdx.x), num_subthreads = static_cast<int>(threadDim.x);
+    const auto num_local_experts = num_experts / num_ranks;
+    const auto num_subthreads_total = num_sms * num_subthreads;
+    const auto subthread_id_in_rank = sm_id * num_subthreads + subthread_id;
+    const auto responsible_subthreads_per_rank = (num_subthreads_total > num_experts ? num_experts : num_subthreads_total) / num_ranks;
+    int flag_dst_rank;
+    int *flag_dst_ptr;
+
+    // constexpr int kNumMaxSubthreads = 8;
+    tops::private_dte engine;
+    engine.init();
+    dte_engine_async dte_engine;
+    EslGdaEngine esl_engine(prims->ibgda_info_ptr, prims->qp_shared_states_ptr, rank, num_ranks);
+    int dst_rank = subthread_id_in_rank % num_ranks;
+    int qp_idx = sm_id % esl_engine.get_num_rc_per_pe();
+    esl_endpoint qp;
+    esl_engine.get_qp(dst_rank, qp_idx, qp);
+    // tops::pdl_wait();
+    volatile int* clean_flag_volatile_ptr;
+
+    if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
+        goto LOW_LATENCY_COMBINE_RECV;
+
+    if (sm_id == 0) {
+        for (int i = subthread_id; i < num_next_clean_int; i += num_subthreads) {
+            next_clean[i] = 0;
+        }
+        __syncsubthreads();
+        for (int i = subthread_id; i < num_subthreads_total; i += num_subthreads) {
+            atomic_clean_flag[i] = FINISHED_CLEAN_FLAG;
+        }
+    }
+    for (int range = subthread_id_in_rank; range < num_experts; range += num_subthreads_total) {
+        const auto dst_rank = range % num_ranks;
+        const auto dst_expert = range / num_ranks;
+        const auto global_expert_idx = rank * num_local_experts + dst_expert;
+        const auto layout = *(layout_range + dst_expert * num_ranks + dst_rank);
+        const auto local_x = static_cast<const tops::__ef_bfloat16*>(x) +
+                dst_expert * num_ranks * num_max_dispatch_tokens_per_rank * hidden;
+        const auto local_src_info = src_info + dst_expert * num_ranks * num_max_dispatch_tokens_per_rank;
+        const auto rdma_send_x_vec = static_cast<tops::__ef_bfloat16*>(rdma_send_x) +
+                dst_expert * num_ranks * num_max_dispatch_tokens_per_rank * hidden;
+        int offset, num_tokens_to_send;
+        unpack2(layout, num_tokens_to_send, offset);
+        // if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
+        uint64_t wqe_idx;
+        if (num_tokens_to_send != 0 && dst_rank != rank) {
+            wqe_idx = esl_engine.get_wqe_slots_raw(&qp, num_tokens_to_send);
+        }
+        for (int token_idx = offset; token_idx < offset + num_tokens_to_send; token_idx += 1) {
+            const auto x_bf16 = local_x + token_idx * hidden;
+            const auto rdma_send_type_row = rdma_send_x_vec + token_idx * hidden;
+            const auto src_idx = *(volatile int*)(local_src_info + token_idx);
+            auto dst_ptr = reinterpret_cast<tops::__ef_bfloat16*>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * hidden;
+            dst_ptr = reinterpret_cast<tops::__ef_bfloat16*>(prims->rdma_peer_base[dst_rank] + ((uint64_t)dst_ptr - (uint64_t)rdma_buffer_ptr));
+            const auto src_ptr = zero_copy ? rdma_send_type_row : x_bf16;
+            if (dst_rank == rank) {
+                dte_engine.memcpyGtoGx(engine, dst_ptr, src_ptr, (ssize_t)hidden);
+            } else {
+                esl_engine.send<NON_ATOMIC_OPERATION, tops::__ef_bfloat16>(dst_ptr, src_ptr, &qp, wqe_idx, hidden, false);
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                esl_engine.ringDb_raw(&qp, wqe_idx, 1);
+                wqe_idx++;
+            }
+        }
+    }
+
+    // Ensure all async local memcpy operations are completed before signaling
+    dte_engine.wait();
+
+    clean_flag_volatile_ptr = (volatile int*)(atomic_clean_flag + subthread_id_in_rank);
+    while (*clean_flag_volatile_ptr != FINISHED_CLEAN_FLAG);
+    if (subthread_id_in_rank < num_experts) {
+        flag_dst_rank = subthread_id_in_rank % num_ranks;
+        flag_dst_ptr = rdma_recv_flag + subthread_id_in_rank / num_ranks + rank * responsible_subthreads_per_rank;
+        flag_dst_ptr = reinterpret_cast<int*>(prims->rdma_peer_base[flag_dst_rank] + ((uint64_t)flag_dst_ptr - (uint64_t)rdma_buffer_ptr));
+        if (flag_dst_rank == rank) {
+            tcle::atomic_add(flag_dst_ptr, 1);
+        } else {
+            uint64_t wqe_idx = esl_engine.get_wqe_slots_raw(&qp, 1);
+            esl_engine.send<NON_ATOMIC_OPERATION, int>(flag_dst_ptr, cached_value_ptrs, &qp, wqe_idx, 1, true);
+            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+            esl_engine.ringDb_raw(&qp, wqe_idx, 1);
+        }
+    }
+    *clean_flag_volatile_ptr = 0;
+
+    LOW_LATENCY_COMBINE_RECV:
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+        return;
+
+    // recv phase 0~num_subthreads_total
+    auto start_time = tops::clock64();
+    uint64_t wait_recv_cost = 0;
+    if (subthread_id_in_rank < num_experts) {
+        while (*(volatile int*)(rdma_recv_flag + subthread_id_in_rank) == 0   // recv not ready
+                && (wait_recv_cost = tops::clock64() - start_time) <= NUM_TIMEOUT_CYCLES    // not timeout
+                );
+        if (wait_recv_cost > NUM_TIMEOUT_CYCLES) {
+            printf("Warning: DeepEP timeout for combine receive, rank %d, idx %d\n", rank, subthread_id_in_rank);
+            // tops::abort();
+        }
+    }
+
+    __syncblocks();
+    int* topk_idx_recast = reinterpret_cast<int*>(const_cast<int64_t*>(topk_idx));
+    float* topk_weight_recast = const_cast<float*>(topk_weights);
+    constexpr int kVecsPerToken = kHidden / 512;
+    for (int vec_range = subthread_id_in_rank; vec_range < num_combined_tokens * kVecsPerToken; vec_range += num_subthreads_total) {
+        __vector4 float combined_values = (__vector4 float)0;
+        auto combine_bf16 = static_cast<tops::__ef_bfloat16*>(combined_x) + vec_range * 512;
+        auto iter = reinterpret_cast<__vector2 __bf16*>(combine_bf16);
+        auto token_idx = vec_range / kVecsPerToken;
+        auto vec_idx = vec_range % kVecsPerToken;
+        tcle::set_vl(num_topk);
+        __vector int topk_idx_reg_vec = *(reinterpret_cast<__vector int *>(topk_idx_recast + token_idx * num_topk));
+        __vector float topk_weight_vec = *(reinterpret_cast<__vector float *>(topk_weight_recast + token_idx * num_topk));
+        tcle::set_vl(DEFAULT_VL_LEN);
+        for (int k = 0; k < num_topk; k++) {
+            int topk_idx_reg = topk_idx_reg_vec[k];
+            float topk_weight = topk_weight_vec[k];
+            topk_weight = (topk_idx_reg >= 0) ? topk_weight : 0.0f;
+            topk_idx_reg = (topk_idx_reg >= 0) ? topk_idx_reg : 0;
+            auto buffer = reinterpret_cast<__vector2 __bf16*>(reinterpret_cast<tops::__ef_bfloat16*>(rdma_recv_x)+
+                          (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * hidden + vec_idx * 512);
+            combined_values +=
+                tcle::cvt<__vector4 float>(*(buffer)) * topk_weight;
+        }
+        *iter = tcle::cvt<__vector2 __bf16>(combined_values);
+    }
+}
+
+void combine(void* combined_x,
+             void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+             const void* x, const int64_t* topk_idx, const float* topk_weights,
+             const int* src_info, const int64_t* layout_range,
+             int64_t* combine_wait_recv_cost_stats,
+             int* next_clean, int num_next_clean_int,
+             int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+             int num_topk, int num_experts, int rank, int num_ranks,
+             bool use_logfmt,
+             void* workspace, int num_device_sms, int max_threads_per_sm,
+             topsStream_t stream, int phases, bool zero_copy, struct primitives* prims, int* cached_value_ptrs, void* rdma_buffer_ptr) {
+    int num_subthreads_per_thread = 8;
+    if (num_ranks < num_subthreads_per_thread) {
+       num_subthreads_per_thread = num_ranks;
+    }
+    const int num_subthreads_total = num_device_sms * max_threads_per_sm * num_subthreads_per_thread;
+    const int num_expert_per_sm = ceil_div(num_experts, num_device_sms * max_threads_per_sm);
+    const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms * max_threads_per_sm);
+    const int num_responsible_subthread_per_rank = num_subthreads_total / num_ranks;
+    EP_HOST_ASSERT(num_expert_per_sm > 0 and num_recv_per_sm >= 0 and num_responsible_subthread_per_rank > 0);
+    int num_sms = ((num_subthreads_total / num_ranks) * num_ranks) / num_subthreads_per_thread;
+    int max_threads_per_sm_used = num_sms / num_device_sms;
+    // Check workspace
+    auto atomic_clean_flag = static_cast<int*>(workspace);
+    EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
+
+    // Online cast cannot use zero-copy
+    EP_HOST_ASSERT(not (zero_copy and use_logfmt));
+#define COMBINE_LAUNCH_CASE(hidden) { \
+    LAUNCH_KERNEL(&cfg, combine<hidden>, \
+              combined_x, \
+              rdma_recv_x, rdma_recv_flag, rdma_send_x, \
+              x, topk_idx, topk_weights, src_info, layout_range, \
+              combine_wait_recv_cost_stats, \
+              next_clean, num_next_clean_int, \
+              atomic_clean_flag, \
+              num_combined_tokens, hidden, num_topk, \
+              num_max_dispatch_tokens_per_rank, \
+              num_experts, rank, num_ranks, \
+              0 /*num_warp_groups */,  0 /*num_warps_per_group*/, \
+              phases, zero_copy, prims, cached_value_ptrs, rdma_buffer_ptr); } break
+    SETUP_LAUNCH_CONFIG(num_device_sms, max_threads_per_sm_used, num_subthreads_per_thread, stream);
+    SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
+#undef COMBINE_LAUNCH_CASE
+}
+
+} // namespace intranode_ll
+
+} // namespace deep_ep

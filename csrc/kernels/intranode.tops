@@ -1,0 +1,2632 @@
+#include "configs.h"
+#include "buffer.h"
+#include "exception.h"
+#include "launch.h"
+#include "intra_lare.h"
+#include "lare_gda.h"
+#include "utils.h"
+
+
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+#ifndef DEEP_EP_INTRANODE_PROF
+#define DEEP_EP_INTRANODE_PROF 0
+#endif
+
+namespace deep_ep {
+
+namespace intranode {
+
+template<int kNumRanks>
+__global__ void
+notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
+                const int* num_tokens_per_expert,
+                int* moe_recv_expert_counter_mapped, int num_experts,
+                int num_tokens, int num_channels, const bool* is_token_in_rank,
+                int* channel_prefix_matrix, int* rank_prefix_matrix_copy,
+                int num_memset_int, int expert_alignment,
+                void** buffer_ptrs, int** barrier_signal_ptrs, int rank,
+                struct primitives* prims, int* cached_value_ptrs,
+                int* actual_num_recv_tokens) {
+            // New parallelization:
+            // sm_id == 0 runs notify; sm_id in [1, kNumRanks]
+            // each handles one dst_rank for per-channel token counting;
+            // SMs with  sm_id > kNumRanks early-return.
+            // Total-SM count is no longer needed.
+            const auto sm_id = static_cast<int>(threadIdx.x) +
+                (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+            auto subthread_id = static_cast<int>(subThreadIdx.x),
+                    num_subthreads = static_cast<int>(threadDim.x);
+            if (sm_id == 0) {
+                const auto channel_id = 0;
+                auto peer_direct_addrs = (uint64_t* volatile*)prims[channel_id].peerDirectAddrs;
+                // peerDirectAddrs uint64-slot layout (see EP_PEER_DIRECT_BUFF_SIZE in devcomm.h):
+                //   [0,            kNumRanks)        recv_addr handshake (not used here)
+                //   [kNumRanks,    2*kNumRanks)      barrier ping
+                //   [2*kNumRanks,  3*kNumRanks)      barrier pong
+                //   [3*kNumRanks,  ... )             notify_rank   : kNumRanks*kNumRanks ints
+                //   [...,          ... )             notify_expert : kNumRanks*num_experts_per_rank ints
+                // Host asserts total usage <= EP_PEER_DIRECT_BUFF_SIZE at notify_dispatch entry.
+                constexpr int kBarrierPing      = kNumRanks;
+                constexpr int kBarrierPong      = 2 * kNumRanks;
+                constexpr int kNotifyRankSlot   = 3 * kNumRanks;
+                constexpr int kNotifyExpertSlot =
+                    kNotifyRankSlot + ceil_div<int>(kNumRanks * kNumRanks * (int)sizeof(int),
+                                                    (int)sizeof(uint64_t));
+
+                const int num_experts_per_rank = num_experts / kNumRanks;
+                // Barrier 1 (ping): wait for all peers ready before we start writing
+                // into their notify regions.
+
+                // the first barrier can be optimize out
+                //barrier_device_peer_memory<kNumRanks>(peer_direct_addrs, rank, kBarrierPing);
+
+                if (subthread_id < kNumRanks) {
+                    const int peer = subthread_id;
+                    int* peer_notify_rank_row = reinterpret_cast<int*>(
+                        peer_direct_addrs[peer] + kNotifyRankSlot)
+                        + rank * kNumRanks;
+                    int* peer_notify_expert_row = reinterpret_cast<int*>(
+                        peer_direct_addrs[peer] + kNotifyExpertSlot)
+                        + rank * num_experts_per_rank;
+                    const int* expert_src =
+                        num_tokens_per_expert + peer * num_experts_per_rank;
+
+                    constexpr int oacc_i32 = TCLE_MAX_VECTOR_LENGTH / sizeof(int);
+
+
+                    #pragma unroll
+                    for (int i = 0; i < kNumRanks; i += oacc_i32) {
+                        tcle::set_vl(std::min(oacc_i32, kNumRanks - i));
+                        auto v = tcle::load<__vector int>((void*)(num_tokens_per_rank + i));
+                        tcle::store(v, peer_notify_rank_row + i);
+                    }
+
+
+                    for (int i = 0; i < num_experts_per_rank; i += oacc_i32) {
+                        tcle::set_vl(std::min(oacc_i32, num_experts_per_rank - i));
+                        auto v = tcle::load<__vector int>((void*)(expert_src + i));
+                        tcle::store(v, peer_notify_expert_row + i);
+                    }
+                    tcle::set_vl(TCLE_MAX_VECTOR_LENGTH);
+                    tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                }
+
+                // Barrier 2 (pong): make all peers' writes visible.
+                barrier_device_peer_memory<kNumRanks>(peer_direct_addrs, rank, kBarrierPong);
+                int* my_notify_rank = reinterpret_cast<int*>(
+                    peer_direct_addrs[rank] + kNotifyRankSlot);
+                int* my_notify_expert = reinterpret_cast<int*>(
+                    peer_direct_addrs[rank] + kNotifyExpertSlot);
+
+                auto local_per_rank_buffer   = reinterpret_cast<int*>(buffer_ptrs[rank]);
+                auto local_per_expert_buffer = local_per_rank_buffer + kNumRanks * kNumRanks;
+
+                if (subthread_id < kNumRanks) {
+                    int acc = my_notify_rank[subthread_id];
+                    local_per_rank_buffer[subthread_id] = acc;
+                    #pragma unroll
+                    for (int i = 1; i < kNumRanks; ++i) {
+                        acc += my_notify_rank[i * kNumRanks + subthread_id];
+                        local_per_rank_buffer[i * kNumRanks + subthread_id] = acc;
+                    }
+                    if (subthread_id == rank) {
+                        // `moe_recv_counter_mapped` / `moe_recv_expert_counter_mapped` are
+                        // host-mapped singletons owned by the Buffer, and the host polls them
+                        // (deep_ep.cpp) only on the `num_worst_tokens == 0` path. Writing them
+                        // when the host is not polling lets an in-flight dispatch satisfy a poll
+                        // that belongs to a different call, which silently yields a wrong
+                        // `num_recv_tokens` there and under-allocates the recv tensors.
+                        // `actual_num_recv_tokens != nullptr` means `num_worst_tokens > 0`.
+                        if (actual_num_recv_tokens != nullptr) {
+                            *actual_num_recv_tokens = acc;
+                        } else {
+                            *moe_recv_counter_mapped = acc;
+                        }
+                    }
+                }
+
+                // Skipped when `num_worst_tokens > 0`: the host builds no
+                // `num_recv_tokens_per_expert_list` on that path, so writing the shared
+                // host-mapped counters would only race with a concurrent eager-path poll.
+                if (actual_num_recv_tokens == nullptr) {
+                    constexpr int oacc_i32 = TCLE_MAX_VECTOR_LENGTH / sizeof(int);
+                    __vector int v_align_m1 = (__vector int)(expert_alignment - 1);
+                    __vector int v_align    = (__vector int)(expert_alignment);
+
+                    for (int i = subthread_id * oacc_i32; i < num_experts_per_rank;
+                         i += num_subthreads * oacc_i32) {
+                        tcle::set_vl(std::min(oacc_i32, num_experts_per_rank - i));
+                        __vector int sum_v =
+                            tcle::load<__vector int>(my_notify_expert + i);
+                        #pragma unroll
+                        for (int j = 1; j < kNumRanks; ++j) {
+                            sum_v = sum_v + tcle::load<__vector int>(
+                                my_notify_expert + j * num_experts_per_rank + i);
+                        }
+                        sum_v = (sum_v + v_align_m1) / v_align * v_align;
+                        tcle::store(sum_v, moe_recv_expert_counter_mapped + i);
+                    }
+                    tcle::set_vl(TCLE_MAX_VECTOR_LENGTH);
+                }
+                __syncsubthreads();
+                //#pragma unroll
+                //for (int i = subthread_id; i < kNumRanks * kNumRanks; i += num_subthreads)
+                //    rank_prefix_matrix_copy[i] = local_per_rank_buffer[i];
+                //#pragma unroll
+                //for (int i = subthread_id; i < num_memset_int; i += num_subthreads)
+                //    local_per_expert_buffer[i] = 0;
+
+                // Vectorized L3->L3 copy of rank_prefix_matrix (kNumRanks*kNumRanks ints).
+                constexpr int oacc_i32 = TCLE_MAX_VECTOR_LENGTH / sizeof(int);
+                constexpr int kPrefixMatrixInts = kNumRanks * kNumRanks;
+                for (int i = subthread_id * oacc_i32; i < kPrefixMatrixInts;
+                     i += num_subthreads * oacc_i32) {
+                    tcle::set_vl(std::min(oacc_i32, kPrefixMatrixInts - i));
+                    auto v = tcle::load<__vector int>(local_per_rank_buffer + i);
+                    tcle::store(v, rank_prefix_matrix_copy + i);
+                }
+
+                // Vectorized L3 memset of per-expert buffer in buffer_ptrs[rank]
+                // (kept for downstream kernels that accumulate there).
+                __vector int zero_vec = (__vector int)(0);
+                for (int i = subthread_id * oacc_i32; i < num_memset_int;
+                     i += num_subthreads * oacc_i32) {
+                    tcle::set_vl(std::min(oacc_i32, num_memset_int - i));
+                    tcle::store(zero_vec, local_per_expert_buffer + i);
+                }
+                tcle::set_vl(TCLE_MAX_VECTOR_LENGTH);
+
+
+                __syncsubthreads();
+                // Barrier 3 (ping): 
+                barrier_device_peer_memory<kNumRanks>(peer_direct_addrs, rank, kBarrierPing);
+            } else {
+                const int dst_rank = sm_id - 1;
+                if (dst_rank >= kNumRanks) return;
+
+                using BoolVT = vector char;
+                using BoolMT = typename tcle::altivector_to_mask<BoolVT>::type;
+                constexpr int kBoolVE = sizeof(BoolVT) / sizeof(char);
+                constexpr int kCountUnroll = 8;
+                constexpr int kCountChunk = kBoolVE * kCountUnroll;
+                BoolVT vone = BoolVT(1);
+
+                // Each subthread processes a strided subset of channels for this
+                // SM's fixed dst_rank.
+                for (int channel_id = subthread_id; channel_id < num_channels;
+                     channel_id += num_subthreads) {
+                    int token_start_idx, token_end_idx;
+                    get_channel_task_range(num_tokens, num_channels, channel_id,
+                                           token_start_idx, token_end_idx);
+
+                    int num_channel_tokens = token_end_idx - token_start_idx;
+                    auto bool_base = reinterpret_cast<char*>(
+                        const_cast<bool*>(is_token_in_rank))
+                        + token_start_idx * kNumRanks + dst_rank;
+
+                    int count = 0;
+                    int partial[kCountUnroll];
+#pragma clang loop unroll(full)
+                    for (int u = 0; u < kCountUnroll; u++) {
+                        partial[u] = 0;
+                    }
+                    int i = 0;
+                    for (; i + kCountChunk <= num_channel_tokens; i += kCountChunk) {
+                        auto ptr = bool_base + i * kNumRanks;
+                        tcle::set_vl(kBoolVE);
+#pragma clang loop unroll(full)
+                        for (int u = 0; u < kCountUnroll; u++) {
+                            BoolVT chunk = tcle::loadeoa<BoolVT>(ptr + u * kBoolVE * kNumRanks, kNumRanks);
+                            BoolMT mask = (chunk == vone);
+                            partial[u] += tcle::popc_mb<0>(mask);
+                        }
+                    }
+#pragma clang loop unroll(full)
+                    for (int u = 0; u < kCountUnroll; u++)
+                        count += partial[u];
+
+                    for (; i < num_channel_tokens; i += kBoolVE) {
+                        int valid = std::min(kBoolVE, num_channel_tokens - i);
+                        tcle::set_vl(valid);
+                        BoolVT chunk = tcle::loadeoa<BoolVT>(bool_base + i * kNumRanks, kNumRanks);
+                        BoolMT mask = (chunk == vone);
+                        count += tcle::popc_mb<0>(mask);
+                    }
+
+                    tcle::set_vl(TCLE_MAX_VECTOR_LENGTH);
+                    channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
+                }
+                __syncsubthreads();
+
+                if (subthread_id == 0) {
+                    for (int i = 1; i < num_channels; ++i) {
+                        channel_prefix_matrix[dst_rank * num_channels + i] +=
+                            channel_prefix_matrix[dst_rank * num_channels + i - 1];
+                    }
+                }
+            }
+
+}
+
+void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
+                     const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
+                     int num_tokens, const bool* is_token_in_rank, int* channel_prefix_matrix,
+                     int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
+                     void** buffer_ptrs, int** barrier_signal_ptrs, int rank, struct primitives* prims,
+                     int* cached_value_ptrs, topsStream_t stream, int num_channels,
+                     int num_device_sms, int max_threads_per_sm,
+                     int* actual_num_recv_tokens) {
+    // Verify the runtime peerDirectBuffAddrs usage fits inside the fixed
+    // EP_PEER_DIRECT_BUFF_SIZE budget.
+    // 3*num_ranks uint64 slots (recv_addr + barrier ping + barrier
+    // pong) + notify_rank (num_ranks*num_ranks ints, rounded up to uint64) +
+    // notify_expert (num_ranks*num_experts_per_rank ints, rounded up) +
+    // cached_notify_combine barrier ping/pong (2*num_ranks uint64 slots after notify_expert).
+    const int num_experts_per_rank = num_experts / num_ranks;
+    const int used_peer_direct_slots =
+        3 * num_ranks
+        + ceil_div<int>(num_ranks * num_ranks * (int)sizeof(int), (int)sizeof(uint64_t))
+        + ceil_div<int>(num_ranks * num_experts_per_rank * (int)sizeof(int), (int)sizeof(uint64_t))
+        + 2 * num_ranks;
+    EP_HOST_ASSERT(used_peer_direct_slots <= EP_PEER_DIRECT_BUFF_SIZE);
+    EP_HOST_ASSERT(num_ranks <= 8);
+
+#define NOTIFY_DISPATCH_LAUNCH_CASE(ranks) \
+    LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, \
+       num_tokens_per_rank, moe_recv_counter_mapped, \
+       num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, \
+       num_tokens, num_channels, is_token_in_rank, channel_prefix_matrix, \
+       rank_prefix_matrix_copy, num_memset_int, expert_alignment, \
+       buffer_ptrs, barrier_signal_ptrs, rank, prims, cached_value_ptrs, \
+       actual_num_recv_tokens); \
+    break;
+
+    SETUP_LAUNCH_CONFIG(num_device_sms, max_threads_per_sm, 8, stream);
+    SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
+#undef NOTIFY_DISPATCH_LAUNCH_CASE
+}
+
+template<int kNumRanks>
+__global__ void
+cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
+                       void** buffer_ptrs, int** barrier_signal_ptrs, int rank, struct primitives* prims, int* cached_value_ptrs) {
+    auto subthread_id = static_cast<int>(subThreadIdx.x), num_subthreads = static_cast<int>(threadDim.x);
+    const auto channel_id = 0;
+    primitives_simple prim(&prims[channel_id], subthread_id, rank);
+    barrier_device<kNumRanks>(cached_value_ptrs, barrier_signal_ptrs, rank, &prim);
+    auto ptr = static_cast<int*>(buffer_ptrs[rank]);
+    for (int i = subthread_id; i < kNumRanks * kNumRanks; i += num_subthreads) {
+        ptr[i] = rank_prefix_matrix[i];
+    }
+    for (int i = subthread_id; i < num_memset_int; i += num_subthreads) {
+        ptr[kNumRanks * kNumRanks + i] = 0;
+    }
+    barrier_device<kNumRanks>(cached_value_ptrs, barrier_signal_ptrs, rank, &prim);
+}
+
+void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
+                            void** buffer_ptrs, int** barrier_signal_ptrs,
+                            int rank, int num_ranks, topsStream_t stream, struct primitives* prims, int* cached_value_ptrs) {
+#define CACHED_NOTIFY_DISPATCH_LAUNCH_CASE(ranks) \
+    LAUNCH_KERNEL(&cfg, cached_notify_dispatch<ranks>, \
+        rank_prefix_matrix, num_memset_int, buffer_ptrs, barrier_signal_ptrs, rank, prims, cached_value_ptrs); \
+    break
+
+    SETUP_LAUNCH_CONFIG(1, 1, 8, stream);
+    SWITCH_RANKS(CACHED_NOTIFY_DISPATCH_LAUNCH_CASE);
+#undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
+}
+
+#define DISPATCH_SCALE_CHUNK_SIZE 128
+// One guard slot per pipe when deriving max_seqelem_num (host only); kernel
+// ring indices still wrap on the full physical slot counts.
+constexpr int DISPATCH_HIDDEN_SLOT_GUARD = 1;
+constexpr int DISPATCH_SCALE_SLOT_GUARD = 1;
+
+template <int kHidden>
+__global__ void
+dispatch(tops::__ef_bfloat16* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
+         int* send_head, const tops::__ef_bfloat16* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
+         const bool* is_token_in_rank, const int* channel_prefix_matrix,
+         int num_tokens, int num_worst_tokens, int num_topk, int num_experts, int num_scales,
+         int scale_token_stride, int scale_hidden_stride,
+         void** buffer_ptrs, int rank, int num_ranks,
+         int num_max_send_tokens, int num_recv_buffer_tokens, int max_seqelem_num,
+         int hidden_slot_num, int scale_slot_num,
+         struct primitives* prims, void* cached_value_ptrs) {
+            constexpr int kMaxNumRanks = 8;
+            // Todo. Theses parameters will be supported later
+            static_cast<void>(num_worst_tokens);
+            static_cast<void>(scale_token_stride);
+            static_cast<void>(scale_hidden_stride);
+            static_cast<void>(num_recv_buffer_tokens);
+            const int hidden_chunk_size = num_max_send_tokens;
+            int* topk_idx_recast = reinterpret_cast<int*>(const_cast<int64_t*>(topk_idx));
+            constexpr int recv_addr_count = 5;
+            uint64_t recv_addr[recv_addr_count]={reinterpret_cast<uint64_t>(recv_x), reinterpret_cast<uint64_t>(recv_src_idx),
+                                                 reinterpret_cast<uint64_t>(recv_topk_idx), reinterpret_cast<uint64_t>(recv_topk_weights),
+                                                 reinterpret_cast<uint64_t>(recv_x_scales)};
+            const auto num_sms = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+            const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+            const auto subthread_id = static_cast<int>(subThreadIdx.x);
+
+            const auto num_subthreads_per_rank = threadDim.x / num_ranks;
+            const auto num_channels = num_sms;
+            const int responsible_rank = (static_cast<int>(subthread_id)) / num_subthreads_per_rank;
+            const auto responsible_channel = sm_id;
+            int num_experts_per_rank = num_experts / num_ranks;
+            // const auto send_subthread_id_in_rank = subthread_id % num_subthreads_per_rank;
+
+            auto num_channels_total = num_channels * num_ranks;
+            auto channel_rank_offset = responsible_channel * num_ranks + responsible_rank;
+            auto ptr = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(buffer_ptrs[rank]) + num_ranks * num_ranks * sizeof(int));
+            auto local_channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+            void* local_staging_base = ptr;
+
+            channel_rank_offset = responsible_channel * num_ranks + rank;
+            ptr = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(buffer_ptrs[responsible_rank]) + num_ranks * num_ranks * sizeof(int));
+            auto remote_channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+            int token_start_idx, token_end_idx;
+            get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+            // ringDB batch (4) & fetchHead batch (16)
+            auto esl_engine = intra_lare_engine<INTRA_LARE_RING_DB_BATCH,
+                INTRA_LARE_FETCH_HEAD_BATCH, true>();
+            //int responsible_rank = subthread_id;
+            //if (sm_id == 0 && subthread_id == 0) { 
+            //  for (int i = 0; i < 24; i++) {
+            //    for (int j = 0; j < 8; j++)
+            //    printf("i %d j %d port %d qp %d\n", i, j, prims[i].primitive[j].lare_dev_info.port_id,prims[i].primitive[j].lare_dev_info.qp_id);
+            //  }
+            //}
+            esl_engine.init(prims, responsible_rank, rank, sm_id, max_seqelem_num);
+
+            int num_tokens_per_channel = token_end_idx - token_start_idx;
+            int cached_offset = token_start_idx * num_ranks + responsible_rank * num_tokens_per_channel;
+            auto channel_cached_idx_value_buffers = Buffer<int>(cached_value_ptrs, num_ranks * num_tokens, cached_offset);
+            auto channel_cached_topk_idx_value_buffers = Buffer<int>(cached_value_ptrs, num_ranks * num_tokens * num_topk, cached_offset * num_topk);
+            auto channel_cached_topk_weights_value_buffers = Buffer<float>(cached_value_ptrs, num_ranks * num_tokens * num_topk, cached_offset * num_topk);
+            auto channel_cached_flag_value_buffers = Buffer<int>(cached_value_ptrs, num_channels_total, responsible_channel * num_ranks + responsible_rank);
+
+            const int hidden_staging_per_thread =
+                hidden_slot_num * hidden_chunk_size * kHidden;
+            auto hidden_staging = Buffer<tops::__ef_bfloat16>(local_staging_base,
+                num_channels * num_ranks * hidden_staging_per_thread,
+                (sm_id * num_ranks + responsible_rank) * hidden_staging_per_thread);
+            int hidden_staging_slot_idx = 0;
+            int hidden_chunk_count = 0;
+            int hidden_chunk_base_channel_idx = 0;
+
+            int scale_staging_per_thread =
+                scale_slot_num * DISPATCH_SCALE_CHUNK_SIZE * num_scales;
+
+            auto scale_staging = Buffer<float>(local_staging_base,
+                num_channels * num_ranks * scale_staging_per_thread,
+                (sm_id * num_ranks + responsible_rank) * scale_staging_per_thread);
+            int scale_staging_slot_idx = 0;
+            int scale_chunk_count = 0;
+            int scale_chunk_base_channel_idx = 0;
+
+            auto peerDirectAddrs_ = (volatile uint64_t* volatile*)prims[sm_id].peerDirectAddrs;
+            __shared__ uint64_t recv_addr_ptrs[recv_addr_count * kMaxNumRanks];
+            auto thread_id = threadIdx.x;
+            if (thread_id < recv_addr_count) {
+                *(peerDirectAddrs_[responsible_rank] + rank) = recv_addr[thread_id];
+                auto start_time = tops::clock64();
+
+                while (true) {
+                    if (*(peerDirectAddrs_[rank] + responsible_rank) != 0xFFFFFFFFFFFFFFFFULL) {
+                        break;
+                    }
+                    if (tops::clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                       printf("DeepEP wait exchange addr timeout\n");
+                    }
+                }
+                recv_addr_ptrs[thread_id * num_ranks + responsible_rank] = *(peerDirectAddrs_[rank] + responsible_rank);
+                *(peerDirectAddrs_[rank] + responsible_rank) = 0xFFFFFFFFFFFFFFFFULL;
+            }
+            __syncthreads();
+
+            auto rank_prefix_matrix = reinterpret_cast<int*>(buffer_ptrs[rank]);
+            // rank_prefix_matrix[0~7] rank0往 rank0~7上发送的num_tokens
+            // rank_prefix_matrix[8~15] rank0+1往 rank0~7上发送的num_tokens
+            int rank_offset = rank > 0 ? rank_prefix_matrix[(rank - 1) * num_ranks + responsible_rank] : 0;
+            int channel_offset = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
+            auto offset_per_channel = channel_offset + rank_offset;
+            // rank_prefix + channel_prefix can exceed ~300k tokens; use 64-bit elem index.
+            auto hidden_elem_offset = [](int64_t token_off) -> int64_t {
+                return token_off * static_cast<int64_t>(kHidden);
+            };
+            
+            *channel_cached_flag_value_buffers.buffer() = -channel_offset - 1;
+
+            int cached_channel_tail_idx = 0;
+            uint64_t remote_token_ptr = recv_addr_ptrs[responsible_rank];
+            uint64_t remote_src_idx_ptr = recv_addr_ptrs[num_ranks + responsible_rank];
+            uint64_t remote_topk_idx_ptr = recv_addr_ptrs[2 * num_ranks + responsible_rank];
+            uint64_t remote_topk_weights_ptr = recv_addr_ptrs[3 * num_ranks + responsible_rank];
+            uint64_t remote_x_scales_ptr = recv_addr_ptrs[4 * num_ranks + responsible_rank];
+            __vector float scale_cache;
+            auto hidden_g2g = InstG2G<kHidden * sizeof(tops::__ef_bfloat16)>();
+
+            constexpr int kVectorSize = 128;
+            using IntVT = typename tcle::altivector<int, kVectorSize>::VT;
+            using FloatVT = typename tcle::altivector<float, kVectorSize>::VT;
+            using UIntVT = typename tcle::altivector<unsigned int, kVectorSize>::VT;
+            using IntMT = typename tcle::altivector_to_mask<IntVT>::type;
+            __local__ __valigned__ int cached_topk_idx_l1[kMaxNumRanks][kVectorSize];
+            __local__ __valigned__ float cached_topk_weights_l1[kMaxNumRanks][kVectorSize];
+            auto cached_topk_idx_stack = cached_topk_idx_l1[subthread_id];
+            auto cached_topk_weights_stack = cached_topk_weights_l1[subthread_id];
+            int cached_topk_base = token_start_idx * num_topk;
+
+            if (num_topk > 0 && token_start_idx < token_end_idx) {
+                tcle::set_vl(std::min(kVectorSize, num_tokens * num_topk - cached_topk_base));
+                auto init_topk_idx_vec = tcle::load<IntVT>((void*)(topk_idx_recast + cached_topk_base));
+                auto init_topk_weights_vec = tcle::load<FloatVT>((void*)(topk_weights + cached_topk_base));
+                tcle::store(init_topk_idx_vec, cached_topk_idx_stack);
+                tcle::store(init_topk_weights_vec, cached_topk_weights_stack);
+                tcle::set_vl(512);
+                tcle::fence<tcle::FenceType::L1_VDMEM_STORE>();
+            }
+
+            // prefetch is_token_in_rank
+            constexpr int kBoolVectorSize = kVectorSize * sizeof(int) / sizeof(uint8_t);
+            using UI8VT = typename tcle::altivector<unsigned char, kBoolVectorSize>::VT;
+            __valigned__ bool cached_is_token_stack[kBoolVectorSize];
+            int cached_is_token_base = (token_start_idx * num_ranks + responsible_rank);
+            if (token_start_idx < token_end_idx) {
+                tcle::set_vl(std::min(kBoolVectorSize, num_tokens * num_ranks - cached_is_token_base));
+                auto cached_is_token_vec = tcle::load<UI8VT>((void*)(is_token_in_rank + cached_is_token_base));
+                tcle::store(cached_is_token_vec, cached_is_token_stack);
+                tcle::set_vl(512);
+                tcle::fence<tcle::FenceType::L1_SDMEM_STORE>();
+            }
+
+            for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
+                const int bool_idx = token_idx * num_ranks + responsible_rank;
+
+
+                if (bool_idx >= cached_is_token_base + kBoolVectorSize) {
+                    cached_is_token_base = bool_idx;
+                    tcle::set_vl(std::min(kBoolVectorSize, num_tokens * num_ranks - cached_is_token_base));
+                    auto cached_is_token_vec = tcle::load<UI8VT>((void*)(is_token_in_rank + cached_is_token_base));
+                    tcle::store(cached_is_token_vec, cached_is_token_stack);
+                    tcle::set_vl(512);
+                    tcle::fence<tcle::FenceType::L1_SDMEM_STORE>();
+                }
+
+                if (!cached_is_token_stack[bool_idx - cached_is_token_base]) {
+                    send_head[token_idx * num_ranks + responsible_rank] = -1;
+                    token_idx++;
+                    continue;
+                }
+                const int topk_start = token_idx * num_topk;
+
+                auto hidden_src = ptr_at_elem(x, hidden_elem_offset(token_idx));
+                // Accumulate hidden into N-way circular staging buffer
+                auto hidden_dst = hidden_staging.buffer() +
+                    hidden_staging_slot_idx * hidden_chunk_size * kHidden +
+                    hidden_chunk_count * kHidden;
+                hidden_g2g.fetch((uint8_t*)hidden_src);
+
+
+                if (num_scales != 0) {
+                    // Accumulate scales into N-way circular staging buffer
+                    auto scale_src = (float*)(x_scales) + token_idx * num_scales;
+                    tcle::set_vl(num_scales);
+                    scale_cache = tcle::load<__vector float>(scale_src);
+                    tcle::set_vl(512);
+                }
+                if (num_topk > 0 && token_idx * num_topk + num_topk - 1 >= cached_topk_base + kVectorSize) {
+                    cached_topk_base = token_idx * num_topk;
+                    tcle::set_vl(std::min(kVectorSize, num_tokens * num_topk - cached_topk_base));
+                    auto cached_topk_idx_vec = tcle::load<IntVT>((void*)(topk_idx_recast + cached_topk_base));
+                    auto cached_topk_weights_vec = tcle::load<FloatVT>((void*)(topk_weights + cached_topk_base));
+                    tcle::store(cached_topk_idx_vec, cached_topk_idx_stack);
+                    tcle::store(cached_topk_weights_vec, cached_topk_weights_stack);
+                    tcle::set_vl(512);
+                    tcle::fence<tcle::FenceType::L1_VDMEM_STORE>();
+                }
+
+                hidden_g2g.store((uint8_t*)hidden_dst);
+                hidden_chunk_count++;
+
+                if (hidden_chunk_count >= hidden_chunk_size) {
+                    auto remote_hidden_dst = ptr_at_elem(
+                        reinterpret_cast<tops::__ef_bfloat16*>(remote_token_ptr),
+                        hidden_elem_offset(static_cast<int64_t>(offset_per_channel) +
+                                           hidden_chunk_base_channel_idx));
+                    tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                    esl_engine.normalSend(remote_hidden_dst,
+                        hidden_staging.buffer() + hidden_staging_slot_idx * hidden_chunk_size * kHidden,
+                        (size_t)hidden_chunk_count * kHidden);
+                    hidden_staging_slot_idx = (hidden_staging_slot_idx + 1) % hidden_slot_num;
+                    hidden_chunk_base_channel_idx = cached_channel_tail_idx + 1;
+                    hidden_chunk_count = 0;
+                }
+
+
+                if (num_scales != 0) {
+                    // Accumulate scales into N-way circular staging buffer
+                    auto scale_dst = scale_staging.buffer() +
+                        scale_staging_slot_idx * DISPATCH_SCALE_CHUNK_SIZE * num_scales +
+                        scale_chunk_count * num_scales;
+
+                    tcle::set_vl(num_scales);
+                    tcle::store(scale_cache, scale_dst);
+                    tcle::set_vl(512);
+                    scale_chunk_count++;
+
+                    if (scale_chunk_count >= DISPATCH_SCALE_CHUNK_SIZE) {
+                        auto remote_dst = reinterpret_cast<float*>(remote_x_scales_ptr) +
+                            (offset_per_channel + scale_chunk_base_channel_idx) * num_scales;
+                        tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                        esl_engine.normalSend(remote_dst,
+                            scale_staging.buffer() + scale_staging_slot_idx * DISPATCH_SCALE_CHUNK_SIZE * num_scales,
+                            scale_chunk_count * num_scales);
+                        scale_staging_slot_idx = (scale_staging_slot_idx + 1) % scale_slot_num;
+                        scale_chunk_base_channel_idx = cached_channel_tail_idx + 1;
+                        scale_chunk_count = 0;
+                    }
+                }
+
+                // Cache source index
+                channel_cached_idx_value_buffers[cached_channel_tail_idx] = token_idx;
+                const int topk_offset = topk_start - cached_topk_base;
+                if (num_topk > 0)
+                {
+                    const int recv_expert_begin = responsible_rank * num_experts_per_rank;
+                    const int recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
+                    tcle::set_vl(num_topk);
+                    IntMT topk_mask = tcle::vset_mb<IntMT>(num_topk);
+                    UIntVT idx_offsets = (tcle::mid<UIntVT>(0) + static_cast<unsigned int>(topk_offset)) *
+                                         static_cast<unsigned int>(sizeof(int));
+                    UIntVT weight_offsets = (tcle::mid<UIntVT>(0) + static_cast<unsigned int>(topk_offset)) *
+                                            static_cast<unsigned int>(sizeof(float));
+                    auto v_idx = tcle::gather<__vector int>(cached_topk_idx_stack, idx_offsets,
+                                                            (__vector int)0, topk_mask);
+                    auto v_weights = tcle::gather<__vector float>(cached_topk_weights_stack, weight_offsets,
+                                                                  (__vector float)0.0f, topk_mask);
+                    __vector bool int valid_idx =
+                        (v_idx >= (__vector int)recv_expert_begin) &&
+                        (v_idx < (__vector int)recv_expert_end);
+                    auto v_remapped = tcle::vsel(valid_idx, v_idx - (__vector int)recv_expert_begin,
+                                                 (__vector int)-1);
+                    auto v_weights_out = tcle::vsel(valid_idx, v_weights, (__vector float)0.0f);
+                    tcle::store(v_remapped, channel_cached_topk_idx_value_buffers.buffer() + cached_channel_tail_idx * num_topk);
+                    tcle::store(v_weights_out, channel_cached_topk_weights_value_buffers.buffer() + cached_channel_tail_idx * num_topk);
+                    tcle::set_vl(512);
+                }
+
+                // save send head
+                send_head[token_idx * num_ranks + responsible_rank] = cached_channel_tail_idx;
+
+                token_idx++;
+                cached_channel_tail_idx++;
+            }
+            // Flush remaining hidden from staging buffer
+            if (hidden_chunk_count > 0) {
+                tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                auto remote_hidden_dst = ptr_at_elem(
+                    reinterpret_cast<tops::__ef_bfloat16*>(remote_token_ptr),
+                    hidden_elem_offset(static_cast<int64_t>(offset_per_channel) +
+                                       hidden_chunk_base_channel_idx));
+                esl_engine.normalSend(remote_hidden_dst,
+                    hidden_staging.buffer() + hidden_staging_slot_idx * hidden_chunk_size * kHidden,
+                    (size_t)hidden_chunk_count * kHidden);
+            }
+            // Flush remaining scales from staging buffer
+            if (num_scales != 0 && scale_chunk_count > 0) {
+                tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                auto remote_dst = reinterpret_cast<float*>(remote_x_scales_ptr) +
+                    (offset_per_channel + scale_chunk_base_channel_idx) * num_scales;
+                esl_engine.normalSend(remote_dst,
+                    scale_staging.buffer() + scale_staging_slot_idx * DISPATCH_SCALE_CHUNK_SIZE * num_scales,
+                    scale_chunk_count * num_scales);
+            }
+
+            if (cached_channel_tail_idx != 0) {
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+
+                esl_engine.normalSend(
+                    reinterpret_cast<int*>(remote_src_idx_ptr) + offset_per_channel,
+                    channel_cached_idx_value_buffers.buffer(), cached_channel_tail_idx);
+                if (num_topk != 0) {
+                    esl_engine.normalSend(
+                        reinterpret_cast<int*>(remote_topk_idx_ptr) + offset_per_channel * num_topk,
+                        channel_cached_topk_idx_value_buffers.buffer(),
+                        cached_channel_tail_idx * num_topk);
+                    esl_engine.normalSend(
+                        reinterpret_cast<float*>(remote_topk_weights_ptr) + offset_per_channel * num_topk,
+                        channel_cached_topk_weights_value_buffers.buffer(), cached_channel_tail_idx * num_topk);
+                }
+            }
+
+            auto src_ptr = channel_cached_flag_value_buffers.buffer();
+            auto dst_ptr = remote_channel_start_offset.buffer();
+            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+            if (responsible_rank == rank) {
+                esl_engine.dteSendAsync(dst_ptr, src_ptr, 1);
+            } else {
+                int curr_idx = esl_engine.getEmptySlot(1);
+                esl_engine.write<NON_ATOMIC_OPERATION>(dst_ptr, src_ptr, curr_idx, 1);
+                esl_engine.ringDb<true>();
+            }
+            //printf("b finish send \n");
+            auto start_time = tops::clock64();
+            while (*((volatile int*)local_channel_start_offset.buffer()) == 0) {
+               if (tops::clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                     printf(0, "DeepEP wait channel offset timeout\n");
+               }
+            }
+            //printf("finish send \n");
+            auto total_offset = *local_channel_start_offset.buffer();
+            total_offset = -total_offset - 1;
+            recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
+            esl_engine.dteMayWait();
+        }
+
+template <int kHidden>
+__global__ void
+dispatch_redundant_sip(tops::__ef_bfloat16* recv_x, float* recv_x_scales, int*
+    recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int*
+    recv_channel_offset,
+         int* send_head, const tops::__ef_bfloat16* x, const float* x_scales,
+             const int64_t* topk_idx, const float* topk_weights,
+         const bool* is_token_in_rank, const int* channel_prefix_matrix,
+         int num_tokens, int num_worst_tokens, int num_topk, int num_experts,
+             int num_scales,
+         int scale_token_stride, int scale_hidden_stride,
+         void** buffer_ptrs, int rank, int num_ranks, int num_channels,
+         int num_max_send_tokens, int num_recv_buffer_tokens, int
+             max_seqelem_num,
+         int hidden_slot_num, int scale_slot_num,
+         struct primitives* prims, void* cached_value_ptrs) {
+            constexpr int kMaxNumRanks = 8;
+            constexpr int kNumDispatchSips = 3;
+            constexpr int recv_addr_count = 5;
+            static_cast<void>(num_worst_tokens);
+            static_cast<void>(scale_token_stride);
+            static_cast<void>(scale_hidden_stride);
+            static_cast<void>(num_recv_buffer_tokens);
+
+            const int hidden_chunk_size = num_max_send_tokens;
+            int* topk_idx_recast =
+                reinterpret_cast<int*>(const_cast<int64_t*>(topk_idx));
+            uint64_t recv_addr[recv_addr_count] = {
+                reinterpret_cast<uint64_t>(recv_x),
+                reinterpret_cast<uint64_t>(recv_src_idx),
+                reinterpret_cast<uint64_t>(recv_topk_idx),
+                reinterpret_cast<uint64_t>(recv_topk_weights),
+                reinterpret_cast<uint64_t>(recv_x_scales)};
+
+            const auto sip_id = static_cast<int>(threadIdx.x) +
+                               (static_cast<int>(blockDim.x) *
+                                   static_cast<int>(blockIdx.x));
+            const auto subthread_id = static_cast<int>(subThreadIdx.x);
+            const auto num_subthreads_per_rank = threadDim.x / num_ranks;
+            const int responsible_rank = static_cast<int>(subthread_id) /
+                num_subthreads_per_rank;
+            // Mailbox stays SIP-static (prims[0/4/8]); channels are claimed
+            // dynamically below.
+            const int mailbox_channel = sip_id * (num_channels /
+                kNumDispatchSips);
+            int num_experts_per_rank = num_experts / num_ranks;
+            auto num_channels_total = num_channels * num_ranks;
+            void* local_staging_base = reinterpret_cast<void*>(
+                reinterpret_cast<int8_t*>(buffer_ptrs[rank]) + num_ranks *
+                    num_ranks * sizeof(int));
+
+            // Each SIP independently exchanges all 5 recv bases on its mailbox
+            // (prims[0/4/8]), using free slots [512, 512+5N).
+            constexpr int kRecvAddrBase = 512;
+            constexpr uint64_t kAddrSentinel = 0xFFFFFFFFFFFFFFFFULL;
+            auto peerDirectAddrs_ =
+                (volatile uint64_t*
+                    volatile*)prims[mailbox_channel].peerDirectAddrs;
+            __local__ uint64_t recv_addr_ptrs[recv_addr_count * kMaxNumRanks];
+            if (responsible_rank < num_ranks) {
+                for (int addr_type = 0; addr_type < recv_addr_count;
+                    ++addr_type) {
+                    *(peerDirectAddrs_[responsible_rank] + kRecvAddrBase +
+                      addr_type * num_ranks + rank) = recv_addr[addr_type];
+                }
+                for (int addr_type = 0; addr_type < recv_addr_count;
+                    ++addr_type) {
+                    volatile uint64_t* my_slot = peerDirectAddrs_[rank] +
+                        kRecvAddrBase +
+                                                addr_type * num_ranks +
+                                                    responsible_rank;
+                    auto start_time = tops::clock64();
+                    while (*my_slot == kAddrSentinel) {
+                        if (tops::clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                            printf("DeepEP wait exchange addr timeout:"
+                                    "rank=%d sip=%d type=%d peer=%d\n",
+                                   rank, sip_id, addr_type, responsible_rank);
+                        }
+                    }
+                    recv_addr_ptrs[addr_type * num_ranks + responsible_rank] =
+                        *my_slot;
+                    *my_slot = kAddrSentinel;
+                }
+            }
+            __syncsubthreads();
+
+            auto hidden_elem_offset = [](int64_t token_off) -> int64_t {
+                return token_off * static_cast<int64_t>(kHidden);
+            };
+
+            constexpr int kVectorSize = 128;
+            using IntVT = typename tcle::altivector<int, kVectorSize>::VT;
+            using FloatVT = typename tcle::altivector<float, kVectorSize>::VT;
+            using UIntVT = typename tcle::altivector<unsigned int,
+                kVectorSize>::VT;
+            using IntMT = typename tcle::altivector_to_mask<IntVT>::type;
+            constexpr int kBoolVectorSize = kVectorSize * sizeof(int) /
+                sizeof(uint8_t);
+            using UI8VT = typename tcle::altivector<unsigned char,
+                kBoolVectorSize>::VT;
+            __local__ __valigned__ int
+                cached_topk_idx_l1[kMaxNumRanks][kVectorSize];
+            __local__ __valigned__ float
+                cached_topk_weights_l1[kMaxNumRanks][kVectorSize];
+            auto cached_topk_idx_stack = cached_topk_idx_l1[subthread_id];
+            auto cached_topk_weights_stack =
+                cached_topk_weights_l1[subthread_id];
+
+            // Online channel claim: after finishing one channel, each SIP
+            // atomic_add's the next id so lighter SIPs pick up more work.
+            // Counter lives at historically unused "end[0]" (notify zeros
+            // num_channels*num_ranks*4 ints after rank_prefix). Staging starts
+            // at C+1 so online claims are not stomped mid-dispatch.
+            int* channel_claim_counter =
+                reinterpret_cast<int*>(local_staging_base) + num_channels_total;
+            constexpr int kMaxChannelsPerSip = 12;
+            __local__ int claimed_ch;
+
+            // Deferred wait buffers for channel offset flags
+            volatile int* channel_offset_wait_bufs[kMaxChannelsPerSip];
+            int channel_offset_wait_ch[kMaxChannelsPerSip];
+            int num_offset_wait = 0;
+
+            while (true) {
+                if (subthread_id == 0) {
+                    claimed_ch = tcle::atomic_add(channel_claim_counter, 1);
+                }
+                __syncsubthreads();
+                // Private copy so ST0 claiming next cannot race others still on
+                // this channel.
+                const int responsible_channel = claimed_ch;
+                if (responsible_channel >= num_channels) {
+                    break;
+                }
+
+                auto channel_rank_offset = responsible_channel * num_ranks +
+                    responsible_rank;
+                void* ptr = local_staging_base;
+                auto local_channel_start_offset = Buffer<int>(ptr,
+                    num_channels_total, channel_rank_offset);
+
+                channel_rank_offset = responsible_channel * num_ranks + rank;
+                ptr = reinterpret_cast<void*>(
+                    reinterpret_cast<int8_t*>(buffer_ptrs[responsible_rank]) +
+                    num_ranks * num_ranks * sizeof(int));
+                auto remote_channel_start_offset = Buffer<int>(ptr,
+                    num_channels_total, channel_rank_offset);
+
+                int token_start_idx, token_end_idx;
+                get_channel_task_range(num_tokens, num_channels,
+                    responsible_channel,
+                                       token_start_idx, token_end_idx);
+
+                // WithDte=false: redundant SIP forbids private_dte
+                // (privateDdteCount must be 0).
+                auto esl_engine = intra_lare_engine<INTRA_LARE_RING_DB_BATCH,
+                    INTRA_LARE_FETCH_HEAD_BATCH, false>();
+                esl_engine.init(prims, responsible_rank, rank,
+                    responsible_channel, max_seqelem_num);
+
+                int num_tokens_per_channel = token_end_idx - token_start_idx;
+                int cached_offset = token_start_idx * num_ranks +
+                    responsible_rank * num_tokens_per_channel;
+                void* cached_ptr = cached_value_ptrs;
+                auto channel_cached_idx_value_buffers =
+                    Buffer<int>(cached_ptr, num_ranks * num_tokens,
+                        cached_offset);
+                auto channel_cached_topk_idx_value_buffers =
+                    Buffer<int>(cached_ptr, num_ranks * num_tokens * num_topk,
+                        cached_offset * num_topk);
+                auto channel_cached_topk_weights_value_buffers =
+                    Buffer<float>(cached_ptr, num_ranks * num_tokens *
+                        num_topk, cached_offset * num_topk);
+                auto channel_cached_flag_value_buffers =
+                    Buffer<int>(cached_ptr, num_channels_total,
+                                responsible_channel * num_ranks +
+                                    responsible_rank);
+
+                const int hidden_staging_per_thread =
+                    hidden_slot_num * hidden_chunk_size * kHidden;
+                // Skip channel flags [0,C) and claim counter at C; staging from
+                // C+1.
+                void* staging_ptr = reinterpret_cast<void*>(
+                    reinterpret_cast<int8_t*>(local_staging_base) +
+                    (num_channels_total + 1) * sizeof(int));
+                auto hidden_staging = Buffer<tops::__ef_bfloat16>(
+                    staging_ptr,
+                    num_channels * num_ranks * hidden_staging_per_thread,
+                    (responsible_channel * num_ranks + responsible_rank) *
+                        hidden_staging_per_thread);
+                int hidden_staging_slot_idx = 0;
+                int hidden_chunk_count = 0;
+                int hidden_chunk_base_channel_idx = 0;
+
+                int scale_staging_per_thread =
+                    scale_slot_num * DISPATCH_SCALE_CHUNK_SIZE * num_scales;
+                auto scale_staging = Buffer<float>(
+                    staging_ptr,
+                    num_channels * num_ranks * scale_staging_per_thread,
+                    (responsible_channel * num_ranks + responsible_rank) *
+                        scale_staging_per_thread);
+                int scale_staging_slot_idx = 0;
+                int scale_chunk_count = 0;
+                int scale_chunk_base_channel_idx = 0;
+
+                auto rank_prefix_matrix =
+                    reinterpret_cast<int*>(buffer_ptrs[rank]);
+                int rank_offset = rank > 0 ? rank_prefix_matrix[(rank - 1) *
+                    num_ranks + responsible_rank] : 0;
+                int channel_offset = responsible_channel > 0
+                    ? channel_prefix_matrix[responsible_rank * num_channels +
+                        responsible_channel - 1]
+                    : 0;
+                auto offset_per_channel = channel_offset + rank_offset;
+
+                *channel_cached_flag_value_buffers.buffer() = -channel_offset -
+                    1;
+
+                int cached_channel_tail_idx = 0;
+                uint64_t remote_token_ptr = recv_addr_ptrs[responsible_rank];
+                uint64_t remote_src_idx_ptr = recv_addr_ptrs[num_ranks +
+                    responsible_rank];
+                uint64_t remote_topk_idx_ptr = recv_addr_ptrs[2 * num_ranks +
+                    responsible_rank];
+                uint64_t remote_topk_weights_ptr = recv_addr_ptrs[3 * num_ranks
+                    + responsible_rank];
+                uint64_t remote_x_scales_ptr = recv_addr_ptrs[4 * num_ranks +
+                    responsible_rank];
+                __vector float scale_cache;
+                auto hidden_g2g = InstG2G<kHidden *
+                    sizeof(tops::__ef_bfloat16)>();
+
+                int cached_topk_base = token_start_idx * num_topk;
+                if (num_topk > 0 && token_start_idx < token_end_idx) {
+                    tcle::set_vl(std::min(kVectorSize, num_tokens * num_topk -
+                        cached_topk_base));
+                    auto init_topk_idx_vec = tcle::load<IntVT>(reinterpret_cast<void*>(topk_idx_recast + cached_topk_base));
+                    auto init_topk_weights_vec = tcle::load<FloatVT>(reinterpret_cast<void*>(const_cast<float *>(topk_weights + cached_topk_base)));
+                    tcle::store(init_topk_idx_vec, cached_topk_idx_stack);
+                    tcle::store(init_topk_weights_vec,
+                        cached_topk_weights_stack);
+                    tcle::set_vl(512);
+                    tcle::fence<tcle::FenceType::L1_VDMEM_STORE>();
+                }
+
+                __valigned__ bool cached_is_token_stack[kBoolVectorSize];
+                int cached_is_token_base = (token_start_idx * num_ranks +
+                    responsible_rank);
+                if (token_start_idx < token_end_idx) {
+                    tcle::set_vl(std::min(kBoolVectorSize, num_tokens *
+                        num_ranks - cached_is_token_base));
+                    auto cached_is_token_vec = tcle::load<UI8VT>(reinterpret_cast<void*>(const_cast<bool *>(is_token_in_rank + cached_is_token_base)));
+                    tcle::store(cached_is_token_vec, cached_is_token_stack);
+                    tcle::set_vl(512);
+                    tcle::fence<tcle::FenceType::L1_SDMEM_STORE>();
+                }
+
+                for (int64_t token_idx = token_start_idx; token_idx <
+                    token_end_idx;) {
+                    const int bool_idx = token_idx * num_ranks +
+                        responsible_rank;
+
+                    if (bool_idx >= cached_is_token_base + kBoolVectorSize) {
+                        cached_is_token_base = bool_idx;
+                        tcle::set_vl(std::min(kBoolVectorSize, num_tokens *
+                            num_ranks - cached_is_token_base));
+                        auto cached_is_token_vec = tcle::load<UI8VT>(reinterpret_cast<void*>(const_cast<bool *>(is_token_in_rank + cached_is_token_base)));
+                        tcle::store(cached_is_token_vec, cached_is_token_stack);
+                        tcle::set_vl(512);
+                        tcle::fence<tcle::FenceType::L1_SDMEM_STORE>();
+                    }
+
+                    if (!cached_is_token_stack[bool_idx -
+                        cached_is_token_base]) {
+                        send_head[token_idx * num_ranks + responsible_rank] =
+                            -1;
+                        token_idx++;
+                        continue;
+                    }
+                    const int topk_start = token_idx * num_topk;
+
+                    auto hidden_src = ptr_at_elem(x,
+                        hidden_elem_offset(token_idx));
+                    // Same-rank: store directly to recv_x, skip staging.
+                    // Cross-rank: store to staging, later LARE-send.
+                    auto hidden_dst = (responsible_rank == rank)
+                        ? ptr_at_elem(
+                            reinterpret_cast<tops::__ef_bfloat16*>(remote_token_ptr),
+                            hidden_elem_offset(static_cast<int64_t>(offset_per_channel) +
+                                               cached_channel_tail_idx))
+                        : (hidden_staging.buffer() +
+                           hidden_staging_slot_idx * hidden_chunk_size *
+                               kHidden +
+                           hidden_chunk_count * kHidden);
+                    hidden_g2g.fetch(reinterpret_cast<uint8_t*>(const_cast<tops::__ef_bfloat16 *>(hidden_src)));
+
+                    if (num_scales != 0) {
+                        auto scale_src = const_cast<float*>(x_scales) +
+                            token_idx * num_scales;
+                        tcle::set_vl(num_scales);
+                        scale_cache = tcle::load<__vector float>(scale_src);
+                        tcle::set_vl(512);
+                    }
+                    if (num_topk > 0 && token_idx * num_topk + num_topk - 1 >=
+                        cached_topk_base + kVectorSize) {
+                        cached_topk_base = token_idx * num_topk;
+                        tcle::set_vl(std::min(kVectorSize, num_tokens *
+                            num_topk - cached_topk_base));
+                        auto cached_topk_idx_vec = tcle::load<IntVT>(reinterpret_cast<void*>(topk_idx_recast + cached_topk_base));
+                        auto cached_topk_weights_vec = tcle::load<FloatVT>(reinterpret_cast<void*>(const_cast<float *>(topk_weights + cached_topk_base)));
+                        tcle::store(cached_topk_idx_vec, cached_topk_idx_stack);
+                        tcle::store(cached_topk_weights_vec,
+                            cached_topk_weights_stack);
+                        tcle::set_vl(512);
+                        tcle::fence<tcle::FenceType::L1_VDMEM_STORE>();
+                    }
+
+                    hidden_g2g.store(reinterpret_cast<uint8_t*>(hidden_dst));
+                    hidden_chunk_count++;
+
+                    if (LIKELY(responsible_rank != rank) && hidden_chunk_count
+                        >= hidden_chunk_size) {
+                        auto remote_hidden_dst = ptr_at_elem(
+                            reinterpret_cast<tops::__ef_bfloat16*>(remote_token_ptr),
+                            hidden_elem_offset(static_cast<int64_t>(offset_per_channel) +
+                                               hidden_chunk_base_channel_idx));
+                        tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                        esl_engine.normalSend(remote_hidden_dst,
+                            hidden_staging.buffer() + hidden_staging_slot_idx *
+                                hidden_chunk_size * kHidden,
+                            static_cast<size_t>(hidden_chunk_count) * kHidden);
+                        hidden_staging_slot_idx = (hidden_staging_slot_idx + 1)
+                            % hidden_slot_num;
+                        hidden_chunk_base_channel_idx = cached_channel_tail_idx
+                            + 1;
+                        hidden_chunk_count = 0;
+                    }
+
+                    if (num_scales != 0) {
+                        if (responsible_rank == rank) {
+                            // Same-rank: direct store to recv scales (no
+                            // staging/chunk).
+                            auto scale_dst =
+                                reinterpret_cast<float*>(remote_x_scales_ptr) +
+                                (offset_per_channel + cached_channel_tail_idx)
+                                    * num_scales;
+                            tcle::set_vl(num_scales);
+                            tcle::store(scale_cache, scale_dst);
+                            tcle::set_vl(512);
+                        } else {
+                            auto scale_dst = scale_staging.buffer() +
+                                scale_staging_slot_idx *
+                                    DISPATCH_SCALE_CHUNK_SIZE * num_scales +
+                                scale_chunk_count * num_scales;
+                            tcle::set_vl(num_scales);
+                            tcle::store(scale_cache, scale_dst);
+                            tcle::set_vl(512);
+                            scale_chunk_count++;
+
+                            if (scale_chunk_count >= DISPATCH_SCALE_CHUNK_SIZE)
+                                { auto remote_dst = reinterpret_cast<float*>(remote_x_scales_ptr) +
+                                    (offset_per_channel +
+                                        scale_chunk_base_channel_idx) *
+                                        num_scales;
+                                tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                                esl_engine.normalSend(remote_dst,
+                                    scale_staging.buffer() +
+                                        scale_staging_slot_idx *
+                                        DISPATCH_SCALE_CHUNK_SIZE * num_scales,
+                                    scale_chunk_count * num_scales);
+                                scale_staging_slot_idx =
+                                    (scale_staging_slot_idx + 1) %
+                                    scale_slot_num;
+                                scale_chunk_base_channel_idx =
+                                    cached_channel_tail_idx + 1;
+                                scale_chunk_count = 0;
+                            }
+                        }
+                    }
+
+                    const int topk_offset = topk_start - cached_topk_base;
+                    if (responsible_rank == rank) {
+                        // Same-rank: direct store src_idx/topk to recv (no
+                        // staging/normalSend).
+                        reinterpret_cast<int*>(remote_src_idx_ptr)[offset_per_channel + cached_channel_tail_idx] =
+                            static_cast<int>(token_idx);
+                        if (num_topk > 0) {
+                            const int recv_expert_begin = responsible_rank *
+                                num_experts_per_rank;
+                            const int recv_expert_end = (responsible_rank + 1)
+                                * num_experts_per_rank;
+                            tcle::set_vl(num_topk);
+                            IntMT topk_mask = tcle::vset_mb<IntMT>(num_topk);
+                            UIntVT idx_offsets = (tcle::mid<UIntVT>(0) +
+                                static_cast<unsigned int>(topk_offset)) *
+                                                 static_cast<unsigned
+                                                     int>(sizeof(int));
+                            UIntVT weight_offsets = (tcle::mid<UIntVT>(0) +
+                                static_cast<unsigned int>(topk_offset)) *
+                                                    static_cast<unsigned
+                                                        int>(sizeof(float));
+                            auto v_idx = tcle::gather<__vector
+                                int>(cached_topk_idx_stack, idx_offsets,
+                                                                    (__vector int)0, topk_mask);
+                            auto v_weights = tcle::gather<__vector
+                                float>(cached_topk_weights_stack,
+                                weight_offsets,
+                                                                          (__vector float)0.0f, topk_mask);
+                            __vector bool int valid_idx =
+                                (v_idx >= (__vector int)recv_expert_begin) &&
+                                (v_idx < (__vector int)recv_expert_end);
+                            auto v_remapped = tcle::vsel(valid_idx, v_idx -
+                                (__vector int)recv_expert_begin,
+                                                         (__vector int)-1);
+                            auto v_weights_out = tcle::vsel(valid_idx,
+                                v_weights, (__vector float)0.0f);
+                            tcle::store(v_remapped,
+                                reinterpret_cast<int*>(remote_topk_idx_ptr) +
+                                    (offset_per_channel +
+                                        cached_channel_tail_idx) * num_topk);
+                            tcle::store(v_weights_out,
+                                reinterpret_cast<float*>(remote_topk_weights_ptr) +
+                                    (offset_per_channel +
+                                        cached_channel_tail_idx) * num_topk);
+                            tcle::set_vl(512);
+                        }
+                    } else {
+                        channel_cached_idx_value_buffers[cached_channel_tail_idx] = token_idx;
+                        if (num_topk > 0) {
+                            const int recv_expert_begin = responsible_rank *
+                                num_experts_per_rank;
+                            const int recv_expert_end = (responsible_rank + 1)
+                                * num_experts_per_rank;
+                            tcle::set_vl(num_topk);
+                            IntMT topk_mask = tcle::vset_mb<IntMT>(num_topk);
+                            UIntVT idx_offsets = (tcle::mid<UIntVT>(0) +
+                                static_cast<unsigned int>(topk_offset)) *
+                                                 static_cast<unsigned
+                                                     int>(sizeof(int));
+                            UIntVT weight_offsets = (tcle::mid<UIntVT>(0) +
+                                static_cast<unsigned int>(topk_offset)) *
+                                                    static_cast<unsigned
+                                                        int>(sizeof(float));
+                            auto v_idx = tcle::gather<__vector
+                                int>(cached_topk_idx_stack, idx_offsets,
+                                                                    (__vector int)0, topk_mask);
+                            auto v_weights = tcle::gather<__vector
+                                float>(cached_topk_weights_stack,
+                                weight_offsets,
+                                                                          (__vector float)0.0f, topk_mask);
+                            __vector bool int valid_idx =
+                                (v_idx >= (__vector int)recv_expert_begin) &&
+                                (v_idx < (__vector int)recv_expert_end);
+                            auto v_remapped = tcle::vsel(valid_idx, v_idx -
+                                (__vector int)recv_expert_begin,
+                                                         (__vector int)-1);
+                            auto v_weights_out = tcle::vsel(valid_idx,
+                                v_weights, (__vector float)0.0f);
+                            tcle::store(v_remapped,
+                                channel_cached_topk_idx_value_buffers.buffer()
+                                + cached_channel_tail_idx * num_topk);
+                            tcle::store(v_weights_out, channel_cached_topk_weights_value_buffers.buffer() + cached_channel_tail_idx * num_topk);
+                            tcle::set_vl(512);
+                        }
+                    }
+
+                    send_head[token_idx * num_ranks + responsible_rank] =
+                        cached_channel_tail_idx;
+                    token_idx++;
+                    cached_channel_tail_idx++;
+                }
+
+                if (LIKELY(responsible_rank != rank)) {
+                    if (hidden_chunk_count > 0) {
+                        tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                        auto remote_hidden_dst = ptr_at_elem(
+                            reinterpret_cast<tops::__ef_bfloat16*>(remote_token_ptr),
+                            hidden_elem_offset(static_cast<int64_t>(offset_per_channel) +
+                                               hidden_chunk_base_channel_idx));
+                        esl_engine.normalSend(remote_hidden_dst,
+                            hidden_staging.buffer() + hidden_staging_slot_idx *
+                                hidden_chunk_size * kHidden,
+                            static_cast<size_t>(hidden_chunk_count) * kHidden);
+                    }
+                    if (num_scales != 0 && scale_chunk_count > 0) {
+                        tcle::fence<tcle::FenceType::L3_MEM_STORE>();
+                        auto remote_dst =
+                            reinterpret_cast<float*>(remote_x_scales_ptr) +
+                            (offset_per_channel + scale_chunk_base_channel_idx)
+                                * num_scales;
+                        esl_engine.normalSend(remote_dst,
+                            scale_staging.buffer() + scale_staging_slot_idx *
+                                DISPATCH_SCALE_CHUNK_SIZE * num_scales,
+                            scale_chunk_count * num_scales);
+                    }
+                    if (cached_channel_tail_idx != 0) {
+                        __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                        esl_engine.normalSend(
+                            reinterpret_cast<int*>(remote_src_idx_ptr) +
+                                offset_per_channel,
+                            channel_cached_idx_value_buffers.buffer(),
+                                cached_channel_tail_idx);
+                        if (num_topk != 0) {
+                            esl_engine.normalSend(
+                                reinterpret_cast<int*>(remote_topk_idx_ptr) +
+                                    offset_per_channel * num_topk,
+                                channel_cached_topk_idx_value_buffers.buffer(),
+                                cached_channel_tail_idx * num_topk);
+                            esl_engine.normalSend(
+                                reinterpret_cast<float*>(remote_topk_weights_ptr) + offset_per_channel * num_topk,
+                                channel_cached_topk_weights_value_buffers.buffer(), cached_channel_tail_idx * num_topk);
+                        }
+                    }
+                }
+
+                auto src_ptr = channel_cached_flag_value_buffers.buffer();
+                auto dst_ptr = remote_channel_start_offset.buffer();
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                if (responsible_rank == rank) {
+                    // Same-rank: write flag via TCLE store (no DTE/ESL).
+                    tcle::set_vl(1);
+                    tcle::store((__vector int)(-channel_offset - 1), dst_ptr);
+                    tcle::set_vl(512);
+                } else {
+                    int curr_idx = esl_engine.getEmptySlot(1);
+                    esl_engine.write<NON_ATOMIC_OPERATION>(dst_ptr, src_ptr,
+                        curr_idx, 1);
+                    esl_engine.ringDb<true>();
+                }
+                // Record offset buffer for deferred wait (moved outside channel
+                // loop)
+                channel_offset_wait_bufs[num_offset_wait] =
+                    local_channel_start_offset.buffer();
+                channel_offset_wait_ch[num_offset_wait] = responsible_channel;
+                num_offset_wait++;
+                __syncsubthreads();
+            }
+
+            // Unified wait for all channel offsets (channels are independent)
+            for (int i = 0; i < num_offset_wait; i++) {
+                auto start_time = tops::clock64();
+                while (*(volatile int*)channel_offset_wait_bufs[i] == 0) {
+                    if (tops::clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP wait channel offset timeout:"
+                                "rank=%d ch=%d peer=%d\n",
+                               rank, channel_offset_wait_ch[i],
+                                   responsible_rank);
+                    }
+                }
+                auto total_offset = *(volatile int*)channel_offset_wait_bufs[i];
+                total_offset = -total_offset - 1;
+                recv_channel_offset[responsible_rank * num_channels +
+                    channel_offset_wait_ch[i]] = total_offset;
+            }
+        }
+
+void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
+              int* send_head, const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
+              const bool* is_token_in_rank, const int* channel_prefix_matrix,
+              int num_tokens, int num_worst_tokens, int hidden, int num_topk, int num_experts, int num_scales,
+              int scale_token_stride, int scale_hidden_stride,
+              void** buffer_ptrs, int rank, int num_ranks,
+              topsStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens,
+              struct primitives* prims, void* cached_value_ptrs) {
+    // Derive LARE QP depth max_seqelem_num (= X) from staging ring capacity.
+    //
+    // M = num_recv_buffer_tokens; kernel rings: hidden_slot_num = M/H,
+    // scale_slot_num = M/S. Guard slots (DISPATCH_*_SLOT_GUARD) shorten N_h/N_s
+    // only in this bound; kernel slot_idx still wraps on full physical depth.
+    //
+    // Let h/s be in-flight hidden/scale payload WQEs (h+s = X+1). One token
+    // stream gives h <= T/H and s <= T/S, so h/s <= S/H, hence
+    //   h <= (X+1) * S/(H+S),  s <= (X+1) * H/(H+S).
+    // Ring safety h <= N_h, s <= N_s with N_h = hidden_ring_slots, etc.:
+    //   X+1 <= N_h * (H+S)/S,  X+1 <= N_s * (H+S)/H  => take min, then -1.
+    // num_scales == 0: no scale pipe, X <= N_h - 1.
+    //
+    // Clamp to MAX_ROCE_SQELEM_NUM - 1; require X >= INTRA_LARE_RING_DB_BATCH
+    // (batched ringDb in intra_lare_engine).
+
+    EP_HOST_ASSERT(num_max_send_tokens > 0);
+    const int H = num_max_send_tokens;
+    constexpr int S = DISPATCH_SCALE_CHUNK_SIZE;
+    const int hidden_slot_num = num_recv_buffer_tokens / H;
+    const int scale_slot_num  = num_recv_buffer_tokens / S;
+    const int hidden_ring_slots = hidden_slot_num - DISPATCH_HIDDEN_SLOT_GUARD;
+    const int scale_ring_slots  = scale_slot_num  - DISPATCH_SCALE_SLOT_GUARD;
+    EP_HOST_ASSERT(hidden_ring_slots >= 1);
+    if (num_scales > 0) {
+        EP_HOST_ASSERT(scale_ring_slots >= 1);
+    }
+    const int max_seqelem_num_by_staging = (num_scales == 0)
+        ? (hidden_ring_slots - 1)
+        : (std::min(hidden_ring_slots * (H + S) / S,
+                    scale_ring_slots  * (H + S) / H) - 1);
+    const int max_seqelem_num = std::min(max_seqelem_num_by_staging,
+                                         MAX_ROCE_SQELEM_NUM - 1);
+    // normalSend posts via ringDb<false>, which only doorbells when
+    // (tailId_ - 1) % INTRA_LARE_RING_DB_BATCH == 0 (see intra_lare.h).
+    // getEmptySlot blocks when tailId_ - headId_ + slots > max_seqelem_num_;
+    // if max_seqelem_num is smaller than the batch size, a partial batch can
+    // fill the credit window before HW ever sees a doorbell, so head never
+    // advances and getEmptySlot deadlocks.
+    EP_HOST_ASSERT(max_seqelem_num >= INTRA_LARE_RING_DB_BATCH);
+
+    // cached_value_ptrs pool capacity guard.
+    //
+    // Pool is allocated once per Buffer in deep_ep.cpp via
+    // INTRANODE_CACHED_VALUE_POOL_BYTES(num_ranks) — keep both sides using the
+    // same macro to avoid drift. Inside the kernel
+    // (see channel_cached_*_value_buffers near intranode.tops:357) the
+    // per-call layout consumes (worst-case offset reach):
+    //   idx  : num_ranks * num_tokens          int   = 4 * num_ranks * num_tokens          B
+    //   tidx : num_ranks * num_tokens * num_topk int = 4 * num_ranks * num_tokens * num_topk B
+    //   tw   : num_ranks * num_tokens * num_topk float= 4 * num_ranks * num_tokens * num_topk B
+    //   flag : num_channels_total                int  = 4 * num_channels * num_ranks       B
+    // i.e. 4 * num_ranks * num_tokens * (1 + 2 * num_topk) + 4 * num_channels_total bytes.
+    // Without this check, exceeding the pool silently corrupts adjacent device memory.
+    {
+        const int num_channels_total = num_sms / 2 * num_ranks;
+        const size_t cached_pool_bytes = INTRANODE_CACHED_VALUE_POOL_BYTES(num_ranks);
+        const size_t cached_need_bytes =
+            static_cast<size_t>(4) * num_ranks * num_tokens * (1 + 2 * num_topk)
+            + static_cast<size_t>(4) * num_channels_total;
+        EP_HOST_ASSERT(cached_need_bytes <= cached_pool_bytes);
+    }
+    // num_sms == 3: redundant-SIP mode (fixed 12 logical channels).
+    // Otherwise: classic 1 SIP : 1 channel (num_channels = num_sms / 2).
+    constexpr int kRedundantSipNumSms = 3;
+    constexpr int kRedundantSipNumChannels = 12;
+    constexpr int kNumDispatchSips = 3;
+    const bool use_redundant_sip = (num_sms == kRedundantSipNumSms);
+    const int num_channels = use_redundant_sip ? kRedundantSipNumChannels :
+        (num_sms / 2);
+
+    // cached_value_ptrs pool capacity guard.
+    // Pool size matches deep_ep.cpp allocation:
+    //   1024 * 1024 * num_ranks * NUM_MAX_INTRA_CHANNELS
+    // Per-call layout (worst-case offset reach):
+    //   idx  : num_ranks * num_tokens          int
+    //   tidx : num_ranks * num_tokens * num_topk int
+    //   tw   : num_ranks * num_tokens * num_topk float
+    //   flag : num_channels_total                int
+    {
+        const int num_channels_total = num_channels * num_ranks;
+        const size_t cached_pool_bytes =
+            static_cast<size_t>(1024) * 1024 * num_ranks *
+                NUM_MAX_INTRA_CHANNELS;
+        const size_t cached_need_bytes =
+            static_cast<size_t>(4) * num_ranks * num_tokens * (1 + 2 * num_topk)
+            + static_cast<size_t>(4) * num_channels_total;
+        EP_HOST_ASSERT(cached_need_bytes <= cached_pool_bytes);
+    }
+
+    if (use_redundant_sip) {
+        // Launch {3, 1, 8} on redundant SIP (1 per SIC / SIP Lite).
+        // Logical channels fixed at 12; SIPs claim channels via atomic_add.
+        constexpr int kRecvAddrBase = 512;
+        constexpr int kRecvAddrTypes = 5;
+        EP_HOST_ASSERT(num_channels % kNumDispatchSips == 0);
+        EP_HOST_ASSERT(kRecvAddrBase + kRecvAddrTypes * num_ranks <=
+            EP_PEER_DIRECT_BUFF_SIZE);
+        EP_HOST_ASSERT(num_ranks == 8);
+        const int num_blocks = 3;
+        const int num_threads = 1;
+        const int num_subthreads_per_thread = 8;
+#define DISPATCH_REDUNDANT_LAUNCH_CASE(hidden_val) { \
+    auto kernel = dispatch_redundant_sip<hidden_val>; \
+    LAUNCH_KERNEL(&cfg, kernel, \
+        reinterpret_cast<tops::__ef_bfloat16*>(recv_x), recv_x_scales, \
+            recv_src_idx, recv_topk_idx, recv_topk_weights, \
+            recv_channel_offset, \
+        send_head, reinterpret_cast<const tops::__ef_bfloat16*>(x), x_scales, \
+            topk_idx, topk_weights, \
+        is_token_in_rank, channel_prefix_matrix, \
+        num_tokens, num_worst_tokens, num_topk, num_experts, num_scales, \
+        scale_token_stride, scale_hidden_stride, \
+        buffer_ptrs, rank, num_ranks, num_channels, \
+        num_max_send_tokens, num_recv_buffer_tokens, max_seqelem_num, \
+        hidden_slot_num, scale_slot_num, prims, cached_value_ptrs); \
+    } break
+
+        SETUP_LAUNCH_CONFIG_REDUNDANT(num_blocks, num_threads,
+            num_subthreads_per_thread, stream);
+        SWITCH_INTRA_HIDDEN(DISPATCH_REDUNDANT_LAUNCH_CASE);
+#undef DISPATCH_REDUNDANT_LAUNCH_CASE
+    } else {
+        // Classic path: 1 SIP owns 1 channel; leave kernel body unchanged.
+        EP_HOST_ASSERT(num_sms % 2 == 0);
+        auto [num_blocks, num_threads, num_subthreads_per_thread] =
+            CALCULATE_LAUNCH_CONFIG_BY_SMS(num_sms, num_ranks);
+#define DISPATCH_LAUNCH_CASE(hidden_val) { \
+    auto kernel = dispatch<hidden_val>; \
+    LAUNCH_KERNEL(&cfg, kernel, \
+        reinterpret_cast<tops::__ef_bfloat16*>(recv_x), recv_x_scales, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
+        send_head, reinterpret_cast<const tops::__ef_bfloat16*>(x), x_scales, topk_idx, topk_weights, \
+        is_token_in_rank, channel_prefix_matrix, \
+        num_tokens, num_worst_tokens, num_topk, num_experts, num_scales, \
+        scale_token_stride, scale_hidden_stride, \
+        buffer_ptrs, rank, num_ranks, \
+        num_max_send_tokens, num_recv_buffer_tokens, max_seqelem_num, \
+        hidden_slot_num, scale_slot_num, prims, cached_value_ptrs); \
+    } break
+
+        SETUP_LAUNCH_CONFIG(num_blocks, num_threads, num_subthreads_per_thread,
+            stream);
+        SWITCH_INTRA_HIDDEN(DISPATCH_LAUNCH_CASE);
+#undef DISPATCH_LAUNCH_CASE
+    }
+}
+
+template<int kNumRanks>
+__global__ void
+cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int,
+                      int num_experts, int** barrier_signal_ptrs, int rank, struct primitives* prims,
+                      int* cached_value_ptrs) {
+    auto num_sms = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+    auto subthread_id = static_cast<int>(subThreadIdx.x), num_subthreads = static_cast<int>(threadDim.x);
+    if (sm_id == 0) {
+        const int channel_id = 0;
+        auto peer_direct_addrs = (uint64_t* volatile*)prims[channel_id].peerDirectAddrs;
+        // Dedicated combine barrier slots after notify_expert (uint64 indices).
+        const int num_experts_per_rank = num_experts / kNumRanks;
+        constexpr int kNotifyRankSlot = 3 * kNumRanks;
+        constexpr int kNotifyExpertSlot =
+            kNotifyRankSlot + ceil_div<int>(kNumRanks * kNumRanks * (int)sizeof(int), (int)sizeof(uint64_t));
+        const int kCombineBarrierPing =
+            kNotifyExpertSlot + ceil_div<int>(kNumRanks * num_experts_per_rank * (int)sizeof(int),
+                                              (int)sizeof(uint64_t));
+        const int kCombineBarrierPong = kCombineBarrierPing + kNumRanks;
+        barrier_device_peer_memory<kNumRanks>(peer_direct_addrs, rank, kCombineBarrierPing);
+        auto ptr = reinterpret_cast<int*>(buffer_ptrs[rank]);
+        __vector int all_zero = (__vector int)(0);
+        constexpr int oacc_i32 = TCLE_MAX_VECTOR_LENGTH / sizeof(int);
+        for (int i = subthread_id * oacc_i32; i < num_memset_int; i += num_subthreads * oacc_i32) {
+            tcle::set_vl(std::min(oacc_i32, num_memset_int - i));
+            tcle::store(all_zero, ptr + i);
+        }
+        barrier_device_peer_memory<kNumRanks>(peer_direct_addrs, rank, kCombineBarrierPong);
+    } else if (subthread_id == 0) {
+        // send_head backward fill: DTE + single-thread row-wise vectorized scan
+        // DTE handles L3→L1 tile prefetch concurrently with compute.
+        // Double-buffered: DTE loads tile N+1 while SIP computes tile N.
+        // 8-row-ahead prefetch within compute to hide L1 VDMEM load latency.
+
+        constexpr int NUM_STAGES = 2;
+        constexpr int TILE_SIZE = 128;
+        __local__ __valigned__ int buf[NUM_STAGES * TILE_SIZE * kNumRanks];
+        tcle::set_vl(kNumRanks);
+
+        tops::local_dte dte_in[NUM_STAGES];
+        tops::event in_event[NUM_STAGES];
+        dte_in[0].init();
+        dte_in[1].init();
+        constexpr unsigned long long max_bytes = (unsigned long long)TILE_SIZE * kNumRanks * sizeof(int);
+        dte_in[0].config_memcpy(&buf[0], send_head, max_bytes, 2);
+        dte_in[1].config_memcpy(&buf[TILE_SIZE * kNumRanks], send_head, max_bytes, 2);
+        bool need_fence = false;
+
+        for (int channel_id = sm_id - 1; channel_id < num_channels; channel_id += num_sms - 1) {
+            int token_start_idx, token_end_idx;
+            get_channel_task_range(num_recv_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+            int total_tokens = token_end_idx - token_start_idx;
+            int num_tiles = (total_tokens + TILE_SIZE - 1) / TILE_SIZE;
+            if (num_tiles == 0) continue;
+
+            __vector int last_head = (__vector int)(1 << 25);
+
+            // Full-tile path: 8-row-ahead prefetch, tarstore for auto-stride output
+            auto scan_full = [&](int* __restrict__ tile_buf,
+                                 int* __restrict__ dst) __attribute__((always_inline)) {
+                __vector int pf0 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 1) * kNumRanks]);
+                __vector int pf1 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 2) * kNumRanks]);
+                __vector int pf2 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 3) * kNumRanks]);
+                __vector int pf3 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 4) * kNumRanks]);
+                __vector int pf4 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 5) * kNumRanks]);
+                __vector int pf5 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 6) * kNumRanks]);
+                __vector int pf6 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 7) * kNumRanks]);
+                __vector int pf7 = tcle::load<__vector int>(&tile_buf[(TILE_SIZE - 8) * kNumRanks]);
+                tcle::tar st_base = tcle::movsr2tar((long long)(dst + (TILE_SIZE - 1) * kNumRanks));
+                tcle::tar st_stride = tcle::movsr2tar((long long)(-(int)(kNumRanks * sizeof(int))));
+#pragma clang loop unroll(full)
+                for (int i = TILE_SIZE - 1; i >= 8; i--) {
+                    __vector int row = pf0;
+                    pf0 = pf1; pf1 = pf2; pf2 = pf3; pf3 = pf4;
+                    pf4 = pf5; pf5 = pf6; pf6 = pf7;
+                    pf7 = tcle::load<__vector int>(&tile_buf[(i - 8) * kNumRanks]);
+                    __vector bool int neg = row < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, row);
+                    last_head = tcle::vsel(neg, last_head, row);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf0 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf0);
+                    last_head = tcle::vsel(neg, last_head, pf0);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf1 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf1);
+                    last_head = tcle::vsel(neg, last_head, pf1);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf2 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf2);
+                    last_head = tcle::vsel(neg, last_head, pf2);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf3 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf3);
+                    last_head = tcle::vsel(neg, last_head, pf3);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf4 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf4);
+                    last_head = tcle::vsel(neg, last_head, pf4);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf5 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf5);
+                    last_head = tcle::vsel(neg, last_head, pf5);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf6 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf6);
+                    last_head = tcle::vsel(neg, last_head, pf6);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf7 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf7);
+                    last_head = tcle::vsel(neg, last_head, pf7);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+            };
+
+            // Partial-tile path: 8-row-ahead prefetch, tarstore for auto-stride output
+            auto scan_partial = [&](int* __restrict__ tile_buf,
+                                    int* __restrict__ dst,
+                                    int len) __attribute__((always_inline)) {
+                if (len <= 8) {
+                    tcle::tar sp_base = tcle::movsr2tar((long long)(dst + (len - 1) * kNumRanks));
+                    tcle::tar sp_stride = tcle::movsr2tar((long long)(-(int)(kNumRanks * sizeof(int))));
+                    for (int i = len - 1; i >= 0; i--) {
+                        __vector int row = tcle::load<__vector int>(&tile_buf[i * kNumRanks]);
+                        __vector bool int neg = row < 0;
+                        __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, row);
+                        last_head = tcle::vsel(neg, last_head, row);
+                        tcle::tarstore(rst, sp_base, sp_stride);
+                    }
+                    return;
+                }
+                __vector int pf0 = tcle::load<__vector int>(&tile_buf[(len - 1) * kNumRanks]);
+                __vector int pf1 = tcle::load<__vector int>(&tile_buf[(len - 2) * kNumRanks]);
+                __vector int pf2 = tcle::load<__vector int>(&tile_buf[(len - 3) * kNumRanks]);
+                __vector int pf3 = tcle::load<__vector int>(&tile_buf[(len - 4) * kNumRanks]);
+                __vector int pf4 = tcle::load<__vector int>(&tile_buf[(len - 5) * kNumRanks]);
+                __vector int pf5 = tcle::load<__vector int>(&tile_buf[(len - 6) * kNumRanks]);
+                __vector int pf6 = tcle::load<__vector int>(&tile_buf[(len - 7) * kNumRanks]);
+                __vector int pf7 = tcle::load<__vector int>(&tile_buf[(len - 8) * kNumRanks]);
+                tcle::tar st_base = tcle::movsr2tar((long long)(dst + (len - 1) * kNumRanks));
+                tcle::tar st_stride = tcle::movsr2tar((long long)(-(int)(kNumRanks * sizeof(int))));
+                for (int i = len - 1; i >= 8; i--) {
+                    __vector int row = pf0;
+                    pf0 = pf1; pf1 = pf2; pf2 = pf3; pf3 = pf4;
+                    pf4 = pf5; pf5 = pf6; pf6 = pf7;
+                    pf7 = tcle::load<__vector int>(&tile_buf[(i - 8) * kNumRanks]);
+                    __vector bool int neg = row < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, row);
+                    last_head = tcle::vsel(neg, last_head, row);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf0 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf0);
+                    last_head = tcle::vsel(neg, last_head, pf0);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf1 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf1);
+                    last_head = tcle::vsel(neg, last_head, pf1);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf2 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf2);
+                    last_head = tcle::vsel(neg, last_head, pf2);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf3 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf3);
+                    last_head = tcle::vsel(neg, last_head, pf3);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf4 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf4);
+                    last_head = tcle::vsel(neg, last_head, pf4);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf5 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf5);
+                    last_head = tcle::vsel(neg, last_head, pf5);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf6 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf6);
+                    last_head = tcle::vsel(neg, last_head, pf6);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+                {
+                    __vector bool int neg = pf7 < 0;
+                    __vector int rst = tcle::vsel(neg, (__vector int)(-1) - last_head, pf7);
+                    last_head = tcle::vsel(neg, last_head, pf7);
+                    tcle::tarstore(rst, st_base, st_stride);
+                }
+            };
+
+            // Trigger first tile DTE
+            int t_end_0 = token_end_idx;
+            int t_start_0 = (t_end_0 - TILE_SIZE > token_start_idx) ? t_end_0 - TILE_SIZE : token_start_idx;
+            int tile_len_0 = t_end_0 - t_start_0;
+            dte_in[0].set_src_addr(send_head + t_start_0 * kNumRanks);
+            dte_in[0].set_total_size((unsigned long long)tile_len_0 * kNumRanks * sizeof(int));
+            if (UNLIKELY(need_fence)) {
+                tcle::fence<tcle::FenceType::L1_VDMEM_LOAD>();
+            }
+            in_event[0] = dte_in[0].trigger();
+            need_fence = true;
+
+            int pq = 0;
+            for (int tile = 0; tile < num_tiles; tile++) {
+                int cur = pq;
+                int nxt = 1 - pq;
+
+                int t_end = token_end_idx - tile * TILE_SIZE;
+                int t_start = (t_end - TILE_SIZE > token_start_idx) ? t_end - TILE_SIZE : token_start_idx;
+                int tile_len = t_end - t_start;
+
+                if (LIKELY(tile + 1 < num_tiles)) {
+                    int t_end_nxt = t_end - TILE_SIZE;
+                    int t_start_nxt = (t_end_nxt - TILE_SIZE > token_start_idx)
+                                      ? t_end_nxt - TILE_SIZE : token_start_idx;
+                    int tile_len_nxt = t_end_nxt - t_start_nxt;
+                    dte_in[nxt].set_src_addr(send_head + t_start_nxt * kNumRanks);
+                    dte_in[nxt].set_total_size((unsigned long long)tile_len_nxt * kNumRanks * sizeof(int));
+
+                    if (LIKELY(tile > 0)) {
+                        tcle::fence<tcle::FenceType::L1_VDMEM_LOAD>();
+                    }
+                    in_event[nxt] = dte_in[nxt].trigger();
+                }
+                in_event[cur].wait();
+
+                int base = cur * TILE_SIZE * kNumRanks;
+                int* tile_buf = buf + base;
+                int* dst = send_head + t_start * kNumRanks;
+
+                if (LIKELY(tile_len == TILE_SIZE)) {
+                    scan_full(tile_buf, dst);
+                } else {
+                    scan_partial(tile_buf, dst, tile_len);
+                }
+
+                pq = nxt;
+            }
+        }
+
+        dte_in[0].destroy();
+        dte_in[1].destroy();
+    }
+}
+
+void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
+                           int num_recv_tokens, int num_memset_int, int num_experts,
+                           int** barrier_signal_ptrs, int rank, int num_ranks,
+                           topsStream_t stream, struct primitives* prims, int* cached_value_ptrs) {
+    EP_HOST_ASSERT(num_experts > 0 && num_experts % num_ranks == 0);
+    const int num_experts_per_rank = num_experts / num_ranks;
+    const int used_peer_direct_slots =
+        3 * num_ranks
+        + ceil_div<int>(num_ranks * num_ranks * (int)sizeof(int), (int)sizeof(uint64_t))
+        + ceil_div<int>(num_ranks * num_experts_per_rank * (int)sizeof(int), (int)sizeof(uint64_t))
+        + 2 * num_ranks;
+    EP_HOST_ASSERT(used_peer_direct_slots <= EP_PEER_DIRECT_BUFF_SIZE);
+
+#define CACHED_NOTIFY_COMBINE(ranks) \
+    LAUNCH_KERNEL(&cfg, cached_notify_combine<ranks>, \
+        buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, num_experts, \
+        barrier_signal_ptrs, rank, \
+        prims, cached_value_ptrs); \
+    break
+    int dev_id = -1;
+    topsDeviceProp_t dev_prop = {};
+    TOPS_CHECK(topsGetDevice(&dev_id));
+    TOPS_CHECK(topsGetDeviceProperties(&dev_prop, dev_id));
+    SETUP_LAUNCH_CONFIG(dev_prop.multiProcessorCount, dev_prop.maxThreadsPerBlock, 8, stream);
+    SWITCH_RANKS(CACHED_NOTIFY_COMBINE);
+#undef CACHED_NOTIFY_COMBINE
+}
+
+template<int kNumRanks, int kHidden>
+__global__ __cooperative__ void
+combine(tops::__ef_bfloat16* combined_x, float* combined_topk_weights,
+        const tops::__ef_bfloat16* x, const float* topk_weights,
+        const tops::__ef_bfloat16* bias_0, const tops::__ef_bfloat16* bias_1,
+        const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
+        int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
+        void** buffer_ptrs, int rank,
+        int num_max_send_tokens, int num_recv_buffer_tokens, struct primitives* prims, int* cached_value_ptrs) {
+    static_cast<void>(src_idx);
+    static_cast<void>(num_tokens);
+    static_cast<void>(cached_value_ptrs);
+
+    // Hardware upper bound on subthreads per SIP; combine launch pins num_subthreads = num_ranks <= 8.
+    static constexpr int kMaxSubthreads = 8;
+    static constexpr uint64_t kCombineTimeoutCycles = NUM_TIMEOUT_CYCLES / 10;
+    static constexpr uint32_t kTimeoutCheckInterval = 256;
+    // Receiver tail-wait fallback: push head every N spins to avoid sender flow-ctrl deadlock (MUST be power of 2).
+    static constexpr uint32_t kHeadUpdateInterval = 16384;
+    // Receiver pushes a head update to sender every this many processed tokens.
+    static constexpr int kRecvHeadSendStep = 16;
+    // Max WQE slots to batch-allocate per flush (half of HW send-queue depth).
+    static constexpr int kEslMaxPostsPerFlush = MAX_ROCE_SQELEM_NUM / 2;
+    static constexpr int kSpecialFlag = 0x5A5AA5A5;
+
+    const auto sm_id = static_cast<int>(threadIdx.x) + (static_cast<int>(blockDim.x) * static_cast<int>(blockIdx.x));
+    const auto subthread_id = static_cast<int>(subThreadIdx.x);
+    const auto num_subthreads = static_cast<int>(threadDim.x);
+    const auto num_sms = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const auto num_channels = num_sms / 2;
+    const bool is_sender = sm_id % 2 == 0;
+    const int channel_id = sm_id / 2;
+
+    static constexpr int hidden_bytes = kHidden * static_cast<int>(sizeof(tops::__ef_bfloat16));
+    int topk_bytes = num_topk * static_cast<int>(sizeof(float));
+    int data_bytes = hidden_bytes + topk_bytes;
+    // Per-token payload = hidden_bytes + topk_bytes + tail_marker(int), 128B-aligned
+    int num_bytes_per_token = (data_bytes + static_cast<int>(sizeof(int)) + 127) & ~127;
+
+    auto hidden_elem_offset = [](int64_t token_off) -> int64_t {
+        return token_off * static_cast<int64_t>(kHidden);
+    };
+
+    uint8_t* esl_buffers[kNumRanks];
+    #pragma unroll
+    for (int i = 0; i < kNumRanks; ++i)
+        esl_buffers[i] = reinterpret_cast<uint8_t*>(buffer_ptrs[i]);
+    uint8_t* buffer_base = esl_buffers[rank];
+
+    // SymBuffer layout: head / tail_buf / barrier / data. Control-first so cached_notify_combine clears from offset 0.
+    void* buf_alloc_ptr = static_cast<void*>(buffer_base);
+    auto esl_channel_head = SymBuffer<int>(
+        buf_alloc_ptr, 1, kNumRanks, channel_id, num_channels);
+    auto esl_channel_tail = SymBuffer<int>(
+        buf_alloc_ptr, 1, kNumRanks, channel_id, num_channels);
+    auto esl_barrier = SymBuffer<int>(
+        buf_alloc_ptr, 1, kNumRanks, channel_id, num_channels);
+    auto esl_channel_data = SymBuffer<uint8_t>(
+        buf_alloc_ptr, num_recv_buffer_tokens * num_bytes_per_token,
+        kNumRanks, channel_id, num_channels);
+    // Control region pre-cleared by cached_notify_combine; this kernel only zeros data-region tail markers at exit.
+    int esl_ctrl_bytes = esl_channel_head.total_bytes + esl_channel_tail.total_bytes +
+                         esl_barrier.total_bytes;
+
+    // ---- Buffer offsets for ESL remote addressing (internode.tops pattern) ----
+    int64_t buffer_offset[kNumRanks];
+    #pragma unroll
+    for (int i = 0; i < kNumRanks; ++i)
+        buffer_offset[i] = static_cast<int64_t>(esl_buffers[i] - esl_buffers[rank]);
+
+    // ---- Init ESL primitives (raw GDA engine, per-token ringDb) ----
+    EslGdaEngine esl_gda(prims[sm_id].ibgda_info_ptr, prims[sm_id].qp_shared_states_ptr, rank, kNumRanks);
+    int qp_idx = sm_id % esl_gda.get_num_rc_per_pe();
+    esl_endpoint esl_qp;
+    if (subthread_id < kNumRanks && subthread_id != rank) {
+        esl_gda.get_qp(subthread_id, qp_idx, esl_qp);
+        // Realign qp_shared_state with HW WQE position (dispatch used lare_engine which leaves qs at 0).
+        uint64_t hw_pos = (uint64_t)tops::lare_get_wqe_slot(esl_qp.port_id, esl_qp.qp_id);
+        volatile struct qp_shared_state* qs =
+            (volatile struct qp_shared_state*)esl_qp.qp_shared_state_ptr;
+        qs->postIdx     = hw_pos;
+        qs->dbTouchIdx  = hw_pos;
+        qs->doneIdx     = hw_pos;
+    }
+
+    tops::private_dte dte;
+    dte.init();
+    tops::event dte_event;
+
+#if DEEP_EP_INTRANODE_PROF
+    uint64_t prof_start = tops::clock64();
+    uint64_t prof_dte_wait_cycles = 0;
+    uint64_t prof_esl_send_cycles = 0;
+    uint64_t prof_flow_ctrl_cycles = 0;
+    uint64_t prof_tail_poll_cycles = 0;
+    uint64_t prof_reduce_cycles = 0;
+    uint64_t prof_head_update_cycles = 0;
+    int prof_num_tokens_sent = 0;
+    int prof_num_esl_flushes = 0;
+    int prof_num_head_updates = 0;
+    int prof_num_tail_spins = 0;
+#endif
+
+    // ===================================================================
+    //  SENDER (even SIPs)
+    // ===================================================================
+    if (is_sender && subthread_id < kNumRanks) {
+        int dst_rank = subthread_id;
+
+        int* head_ptr = esl_channel_head.recv_buffer(dst_rank);
+        uint8_t* data_send_buf = (dst_rank == rank) ? esl_channel_data.recv_buffer(rank)
+                                                    : esl_channel_data.send_buffer(dst_rank);
+
+        int rank_offset = dst_rank > 0 ? rank_prefix_matrix[(dst_rank - 1) * kNumRanks + rank] : 0;
+        int num_rank_tokens = rank_prefix_matrix[dst_rank * kNumRanks + rank] - rank_offset;
+
+        // channel_prefix_matrix is actually recv_channel_prefix_matrix (exclusive prefix sum):
+        //   channel_prefix_matrix[D * num_channels + C] = count of dst_rank D's tokens from channels 0..C-1
+        int channel_offset = channel_prefix_matrix[dst_rank * num_channels + channel_id];
+        int next_channel_offset = (channel_id < num_channels - 1)
+            ? channel_prefix_matrix[dst_rank * num_channels + channel_id + 1]
+            : num_rank_tokens;
+        int num_channel_tokens = next_channel_offset - channel_offset;
+        int token_start_idx = rank_offset + channel_offset;
+        int token_end_idx = token_start_idx + num_channel_tokens;
+
+        int cached_tail = 0;
+
+        while (token_start_idx < token_end_idx) {
+            int num_to_send = token_end_idx - token_start_idx;
+            int num_in_chunk = (num_to_send < num_max_send_tokens) ? num_to_send : num_max_send_tokens;
+            if (num_in_chunk > kEslMaxPostsPerFlush - 2)
+                num_in_chunk = kEslMaxPostsPerFlush - 2;
+
+            uint64_t fc_start = tops::clock64();
+            uint32_t wait_spins = 0;
+            bool fc_timed_out_printed = false;
+            while (true) {
+                int used = cached_tail - *(volatile int*)head_ptr;
+                if (num_recv_buffer_tokens - used >= num_in_chunk) break;
+                if (!fc_timed_out_printed &&
+                    ((++wait_spins) & (kTimeoutCheckInterval - 1)) == 0 &&
+                    tops::clock64() - fc_start > kCombineTimeoutCycles) {
+                    volatile struct qp_shared_state* qs_dbg =
+                        (volatile struct qp_shared_state*) esl_qp.qp_shared_state_ptr;
+                    int head_now = *(volatile int*)head_ptr;
+                    int my_send_slot_tail0 = -1;
+                    {
+                        int probe_slot = (cached_tail % num_recv_buffer_tokens);
+                        volatile int* probe_st = reinterpret_cast<volatile int*>(
+                            data_send_buf + probe_slot * num_bytes_per_token + data_bytes);
+                        my_send_slot_tail0 = *probe_st;
+                    }
+                    printf("[combine][timeup][Sender flow ctrl] rank=%d ch=%d dst=%d tail=%d head=%d need=%d cap=%d "
+                           "tok_lo=%d tok_hi=%d post=%lu done=%lu my_slot_tail=%d\n",
+                           rank, channel_id, dst_rank, cached_tail, head_now,
+                           num_in_chunk, num_recv_buffer_tokens,
+                           token_start_idx, token_end_idx,
+                           qs_dbg->postIdx, qs_dbg->doneIdx, my_send_slot_tail0);
+                    fc_timed_out_printed = true;
+                }
+            }
+#if DEEP_EP_INTRANODE_PROF
+            prof_flow_ctrl_cycles += tops::clock64() - fc_start;
+#endif
+
+            if (num_in_chunk > 0) {
+                int slot = cached_tail % num_recv_buffer_tokens;
+                uint8_t* cur_send = data_send_buf + slot * num_bytes_per_token;
+                uint8_t* cur_recv_local = reinterpret_cast<uint8_t*>(
+                    esl_channel_data.recv_buffer(rank)) + slot * num_bytes_per_token;
+                int token_idx = token_start_idx;
+
+                // Staggered submission state: data and tail are sent in
+                // separate WRs so QP ordering guarantees data-before-tail.
+                const int tail_bytes = num_bytes_per_token - data_bytes;
+                bool seg_active = false;
+                int prev_slot = -1;
+                uint8_t* prev_send = nullptr;
+                uint8_t* prev_recv_local = nullptr;
+
+                // Batch all tokens in this chunk under ringDb(s).
+                uint64_t wqe_base = 0;
+                uint64_t wqe_idx = 0;
+                int wqe_budget = 0;
+                int pending_wqes = 0;
+                if (dst_rank != rank) {
+                    int max_wqes = num_in_chunk + 2;
+                    int wqe_alloc = (max_wqes <= kEslMaxPostsPerFlush) ? max_wqes : kEslMaxPostsPerFlush;
+
+                    wqe_base = esl_gda.get_wqe_slots_raw(&esl_qp, wqe_alloc);
+                    wqe_idx = wqe_base;
+                    wqe_budget = wqe_alloc;
+                }
+
+                dte.config_memcpy(tops::mdspan(tops::Global, cur_send, hidden_bytes),
+                                  tops::mdspan(tops::Global,
+                                                (uint8_t*)ptr_at_elem(x, hidden_elem_offset(token_idx)),
+                                                hidden_bytes));
+                dte_event = dte.trigger();
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    auto v_w = tcle::load<__vector float>((float*)(topk_weights + token_idx * num_topk));
+                    tcle::store(v_w, (float*)(cur_send + hidden_bytes));
+                }
+
+                for (int ci = 0; ci < num_in_chunk; ++ci, ++token_idx) {
+#if DEEP_EP_INTRANODE_PROF
+                    uint64_t t0 = tops::clock64();
+#endif
+                    dte_event.wait();
+#if DEEP_EP_INTRANODE_PROF
+                    prof_dte_wait_cycles += tops::clock64() - t0;
+#endif
+
+                    *(volatile int*)(cur_send + data_bytes) = cached_tail + ci + 1;
+
+                    bool has_next = (ci + 1) < num_in_chunk;
+                    uint8_t* next_send = nullptr;
+                    uint8_t* next_recv_local = nullptr;
+                    if (has_next) {
+                        int next_slot = (cached_tail + ci + 1) % num_recv_buffer_tokens;
+                        next_send = data_send_buf + next_slot * num_bytes_per_token;
+                        next_recv_local = reinterpret_cast<uint8_t*>(
+                            esl_channel_data.recv_buffer(rank)) + next_slot * num_bytes_per_token;
+                        dte.config_memcpy(
+                            tops::mdspan(tops::Global, next_send, hidden_bytes),
+                            tops::mdspan(tops::Global,
+                                          (uint8_t*)ptr_at_elem(x, hidden_elem_offset(token_idx + 1)),
+                                          hidden_bytes));
+                        dte_event = dte.trigger();
+                        if (num_topk > 0) {
+                            tcle::set_vl(num_topk);
+                            auto v_w2 = tcle::load<__vector float>(
+                                (float*)(topk_weights + (token_idx + 1) * num_topk));
+                            tcle::store(v_w2, (float*)(next_send + hidden_bytes));
+                        }
+                    }
+
+                    if (dst_rank != rank) {
+#if DEEP_EP_INTRANODE_PROF
+                        uint64_t esl_t0 = tops::clock64();
+#endif
+
+                        // --- Staggered submission (错位提交) ---
+                        // Segment rule (same as internode dispatch):
+                        //   seg_start : send data-only  (data_bytes)
+                        //   seg_mid   : send [prev_tail | curr_data] (num_bytes_per_token)
+                        //   seg_end   : send tail-only  (tail_bytes)
+                        // Segment boundary: slot not contiguous (incl. ring wrap).
+
+                        int cur_slot = (cached_tail + ci) % num_recv_buffer_tokens;
+                        bool contiguous = seg_active && (cur_slot == prev_slot + 1);
+                        bool start_new_seg = !seg_active || !contiguous;
+
+                        int wqes_needed = 1;
+                        if (seg_active && start_new_seg) wqes_needed++;
+                        if (!has_next) wqes_needed++;
+
+                        if (wqe_budget < wqes_needed) {
+                            if (pending_wqes > 0) {
+                                tcle::fence<tcle::L3_MEM_STORE>();
+                                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                                esl_gda.ringDb_raw(&esl_qp, wqe_base, pending_wqes);
+#if DEEP_EP_INTRANODE_PROF
+                                prof_num_esl_flushes++;
+#endif
+                                pending_wqes = 0;
+                            }
+
+                            int remaining_tokens = num_in_chunk - ci;
+                            int max_wqes = remaining_tokens + 2;
+                            int wqe_alloc = (max_wqes <= kEslMaxPostsPerFlush) ? max_wqes : kEslMaxPostsPerFlush;
+
+                            {
+                                volatile struct qp_shared_state* qp_st =
+                                    (volatile struct qp_shared_state*) esl_qp.qp_shared_state_ptr;
+                                qp_st->postIdx = wqe_idx;
+                            }
+                            wqe_base = esl_gda.get_wqe_slots_raw(&esl_qp, wqe_alloc);
+                            wqe_idx = wqe_base;
+                            wqe_budget = wqe_alloc;
+                        }
+
+                        if (seg_active && start_new_seg) {
+                            esl_gda.send<NON_ATOMIC_OPERATION, uint8_t>(
+                                prev_recv_local + data_bytes + buffer_offset[dst_rank],
+                                prev_send + data_bytes, &esl_qp, wqe_idx,
+                                (size_t)tail_bytes, false);
+                            wqe_idx++; wqe_budget--; pending_wqes++;
+                        }
+
+                        if (start_new_seg) {
+                            esl_gda.send<NON_ATOMIC_OPERATION, uint8_t>(
+                                cur_recv_local + buffer_offset[dst_rank],
+                                cur_send, &esl_qp, wqe_idx,
+                                (size_t)data_bytes, false);
+                        } else {
+                            esl_gda.send<NON_ATOMIC_OPERATION, uint8_t>(
+                                prev_recv_local + data_bytes + buffer_offset[dst_rank],
+                                prev_send + data_bytes, &esl_qp, wqe_idx,
+                                (size_t)num_bytes_per_token, false);
+                        }
+                        wqe_idx++; wqe_budget--; pending_wqes++;
+                        seg_active = true;
+
+                        prev_slot = cur_slot;
+                        prev_send = cur_send;
+                        prev_recv_local = cur_recv_local;
+
+                        if (!has_next) {
+                            esl_gda.send<NON_ATOMIC_OPERATION, uint8_t>(
+                                cur_recv_local + data_bytes + buffer_offset[dst_rank],
+                                cur_send + data_bytes, &esl_qp, wqe_idx,
+                                (size_t)tail_bytes, false);
+                            wqe_idx++; wqe_budget--; pending_wqes++;
+
+                            tcle::fence<tcle::L3_MEM_STORE>();
+                            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                            esl_gda.ringDb_raw(&esl_qp, wqe_base, pending_wqes);
+#if DEEP_EP_INTRANODE_PROF
+                            prof_num_esl_flushes++;
+#endif
+                            pending_wqes = 0;
+
+                            volatile struct qp_shared_state* qp_st =
+                                (volatile struct qp_shared_state*) esl_qp.qp_shared_state_ptr;
+                            qp_st->postIdx = wqe_idx;
+                        }
+#if DEEP_EP_INTRANODE_PROF
+                        prof_esl_send_cycles += tops::clock64() - esl_t0;
+#endif
+                    }
+
+                    if (has_next) {
+                        cur_send = next_send;
+                        cur_recv_local = next_recv_local;
+                    }
+                }
+            }
+
+            cached_tail += num_in_chunk;
+#if DEEP_EP_INTRANODE_PROF
+            prof_num_tokens_sent += num_in_chunk;
+#endif
+            if (dst_rank == rank) {
+                tcle::fence<tcle::L3_MEM_STORE>();
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+            }
+
+            token_start_idx += num_in_chunk;
+        }
+    }
+
+    // ===================================================================
+    //  RECEIVER (odd SIPs)
+    // ===================================================================
+    if (!is_sender) {
+        // Per-receiver-SIP scratchpad: subs write their own column, do_head_update reads min across columns.
+        __local__ __valigned__ volatile int cache_head[kNumRanks][kMaxSubthreads];
+
+        // SIP-local soft-barrier flags replacing post-loop __syncsubthreads() to keep do_head_update flowing while waiting.
+        __local__ __valigned__ volatile int post_loop_arrived[kMaxSubthreads];
+
+        // Double-buffered L1 staging: CDTE streams (hidden + topk_weights) HBM->L1; SIP reduces from L1. 128B-aligned rows.
+        static constexpr int kMaxNumTopk   = 32;
+        static constexpr int kMaxTopkBytes = kMaxNumTopk * static_cast<int>(sizeof(float));
+        static constexpr int kNumStages    = 2;
+        EP_STATIC_ASSERT(kNumStages == 2, "double-buffer indexing below uses s & 1");
+        __local__ __valigned__ uint8_t reduce_stage[kMaxSubthreads][kNumStages][hidden_bytes + kMaxTopkBytes];
+
+        // Reuse kernel-scope `dte` — VC cap is 11/SIP and existing private_dte already uses 8/11.
+
+        #pragma unroll
+        for (int r = subthread_id; r < kNumRanks; r += num_subthreads)
+            for (int s = 0; s < kMaxSubthreads; s++)
+                cache_head[r][s] = 0;
+        if (subthread_id == 0) {
+            for (int s = 0; s < kMaxSubthreads; s++) post_loop_arrived[s] = 0;
+        }
+        __syncsubthreads();
+
+        int last_written_head[kNumRanks];
+        #pragma unroll
+        for (int i = 0; i < kNumRanks; i++) last_written_head[i] = 0;
+        int last_sent_head = 0;
+        int my_responsible_rank = subthread_id % kNumRanks;
+
+        int token_start_idx, token_end_idx;
+        get_channel_task_range(num_recv_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+
+        // Push consumed-slot count to remote senders. NOTE sentinel 1<<25 is benign as long as num_recv_tokens << 1<<25.
+        auto do_head_update = [&]() {
+            if (subthread_id >= kNumRanks) return;
+
+            int min_h = cache_head[my_responsible_rank][0];
+            for (int s = 1; s < num_subthreads; s++) {
+                int v = cache_head[my_responsible_rank][s];
+                min_h = (v < min_h) ? v : min_h;
+            }
+            if (min_h <= 0 || min_h <= last_sent_head) return;
+
+            if (my_responsible_rank == rank) {
+                *(volatile int*)esl_channel_head.recv_buffer(rank) = min_h;
+                tcle::fence<tcle::L3_MEM_STORE>();
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+            } else {
+                // ESL-push head to remote sender's recv_buffer[rank].
+                int* head_send_buf = esl_channel_head.send_buffer(my_responsible_rank);
+                *(volatile int*)head_send_buf = min_h;
+
+                uint8_t* remote_dst = (uint8_t*)esl_channel_head.recv_buffer(rank)
+                                    + buffer_offset[my_responsible_rank];
+                uint64_t head_wqe = esl_gda.get_wqe_slots_raw(&esl_qp, 1);
+                esl_gda.send<NON_ATOMIC_OPERATION, uint8_t>(
+                    remote_dst, (uint8_t*)head_send_buf, &esl_qp, head_wqe,
+                    sizeof(int), true);
+                tcle::fence<tcle::L3_MEM_STORE>();
+                __gcu_get_spr_barrier(BARRIER_MASK_L3);
+                esl_gda.ringDb_raw(&esl_qp, head_wqe, 1);
+            }
+            last_sent_head = min_h;
+        };
+
+        // Prime next-token send_head prefetch to stack (one vector HBM load vs kNumRanks scalar loads).
+        int expected_slots[kNumRanks] __valigned__;
+        {
+            int first_token_idx = token_start_idx + subthread_id;
+            if (first_token_idx < token_end_idx) {
+                tcle::set_vl(kNumRanks);
+                tcle::store(
+                    tcle::load<__vector int>(send_head + first_token_idx * kNumRanks),
+                    expected_slots);
+            }
+        }
+
+        // Pre-build recv DTE descriptor once; per-iter only pays set_*_addr + trigger.
+        const int transfer_bytes = hidden_bytes + topk_bytes;
+        dte.config_memcpy(
+            tops::mdspan(tops::Local,  reduce_stage[subthread_id][0], transfer_bytes),
+            tops::mdspan(tops::Global,
+                         reinterpret_cast<uint8_t*>(esl_channel_data.recv_buffer(0)),
+                         transfer_bytes));
+
+        int recv_processed = 0;
+        for (int token_idx = token_start_idx + subthread_id;
+             token_idx < token_end_idx;
+             token_idx += num_subthreads) {
+
+            uint8_t* source_ptrs[kNumRanks];
+            int source_ri[kNumRanks];
+            int pending_head[kNumRanks];
+            int num_sources = 0;
+
+            // Poll each source; first-seen one fires its HBM->L1 DTE early to overlap with remaining polls.
+#if DEEP_EP_INTRANODE_PROF
+            uint64_t poll_t0 = tops::clock64();
+#endif
+            for (int ri = 0; ri < kNumRanks; ri++) {
+                int expected_slot = expected_slots[ri];
+
+                // Negative encoding from cached_notify_combine: decoded = -expected_slot - 1 = last_head (init 1<<25).
+                if (expected_slot < 0) {
+                    int decoded = -expected_slot - 1;
+                    if (decoded > last_written_head[ri]) {
+                        cache_head[ri][subthread_id] = decoded;
+                        last_written_head[ri] = decoded;
+                    }
+                    continue;
+                }
+
+                if (expected_slot > last_written_head[ri]) {
+                    cache_head[ri][subthread_id] = expected_slot;
+                    last_written_head[ri] = expected_slot;
+                }
+
+                int buf_slot = expected_slot % num_recv_buffer_tokens;
+                uint8_t* slot_base = reinterpret_cast<uint8_t*>(
+                    esl_channel_data.recv_buffer(ri)) + buf_slot * num_bytes_per_token;
+                volatile int* slot_tail = reinterpret_cast<volatile int*>(slot_base + data_bytes);
+                int expected_tail_val = expected_slot + 1;
+
+                uint64_t wait_start = tops::clock64();
+                uint32_t spin_cnt = 0;
+                bool recv_tail_timed_out_printed = false;
+                while (true) {
+                    int got = *slot_tail;
+                    if (got == expected_tail_val) break;
+                    spin_cnt++;
+                    if ((spin_cnt & (kHeadUpdateInterval - 1)) == 0) {
+#if DEEP_EP_INTRANODE_PROF
+                        uint64_t hu_t0 = tops::clock64();
+#endif
+                        do_head_update();
+#if DEEP_EP_INTRANODE_PROF
+                        prof_head_update_cycles += tops::clock64() - hu_t0;
+                        prof_num_head_updates++;
+#endif
+                    }
+                    if (!recv_tail_timed_out_printed &&
+                        (spin_cnt & (kTimeoutCheckInterval - 1)) == 0 &&
+                        tops::clock64() - wait_start > kCombineTimeoutCycles) {
+                        volatile struct qp_shared_state* qs_dbg =
+                            (volatile struct qp_shared_state*) esl_qp.qp_shared_state_ptr;
+                        int prev_slot_tail = -1, next_slot_tail = -1;
+                        {
+                            int prev_slot = (buf_slot + num_recv_buffer_tokens - 1) % num_recv_buffer_tokens;
+                            int next_slot = (buf_slot + 1) % num_recv_buffer_tokens;
+                            volatile int* p_st = reinterpret_cast<volatile int*>(
+                                reinterpret_cast<uint8_t*>(esl_channel_data.recv_buffer(ri))
+                                + prev_slot * num_bytes_per_token + data_bytes);
+                            volatile int* n_st = reinterpret_cast<volatile int*>(
+                                reinterpret_cast<uint8_t*>(esl_channel_data.recv_buffer(ri))
+                                + next_slot * num_bytes_per_token + data_bytes);
+                            prev_slot_tail = *p_st;
+                            next_slot_tail = *n_st;
+                        }
+                        int ch0 = cache_head[ri][0];
+                        int ch1 = (kMaxSubthreads > 1) ? cache_head[ri][1] : -1;
+                        int ch2 = (kMaxSubthreads > 2) ? cache_head[ri][2] : -1;
+                        int ch3 = (kMaxSubthreads > 3) ? cache_head[ri][3] : -1;
+                        int ch4 = (kMaxSubthreads > 4) ? cache_head[ri][4] : -1;
+                        int ch5 = (kMaxSubthreads > 5) ? cache_head[ri][5] : -1;
+                        int ch6 = (kMaxSubthreads > 6) ? cache_head[ri][6] : -1;
+                        int ch7 = (kMaxSubthreads > 7) ? cache_head[ri][7] : -1;
+                        printf("[combine][timeup][Recv wait tail] rank=%d ch=%d tok=%d ri=%d slot=%d exp_tail=%d got=%d "
+                               "prev_tail=%d next_tail=%d last_sent_head=%d last_written=%d recv_proc=%d post=%lu done=%lu "
+                               "ch_row[ri=%d]={%d,%d,%d,%d,%d,%d,%d,%d}\n",
+                               rank, channel_id, token_idx, ri, buf_slot, expected_tail_val, got,
+                               prev_slot_tail, next_slot_tail,
+                               last_sent_head, last_written_head[ri], recv_processed,
+                               qs_dbg->postIdx, qs_dbg->doneIdx,
+                               ri, ch0, ch1, ch2, ch3, ch4, ch5, ch6, ch7);
+                        recv_tail_timed_out_printed = true;
+                    }
+                }
+#if DEEP_EP_INTRANODE_PROF
+                prof_num_tail_spins += spin_cnt;
+#endif
+
+                source_ri[num_sources] = ri;
+                pending_head[num_sources] = expected_slot + 1;
+                source_ptrs[num_sources++] = slot_base;
+
+                // First source: kick its HBM->L1 stage[0] DTE now.
+                if (num_sources == 1) {
+                    dte.set_dst_addr(reduce_stage[subthread_id][0]);
+                    dte.set_src_addr(slot_base);
+                    dte_event = dte.trigger();
+                }
+            }
+#if DEEP_EP_INTRANODE_PROF
+            prof_tail_poll_cycles += tops::clock64() - poll_t0;
+#endif
+
+            // Prefetch next token's send_head; HBM round-trip hidden behind the upcoming reduce.
+            int next_token_idx = token_idx + num_subthreads;
+            if (next_token_idx < token_end_idx) {
+                tcle::set_vl(kNumRanks);
+                tcle::store(
+                    tcle::load<__vector int>(send_head + next_token_idx * kNumRanks),
+                    expected_slots);
+            }
+
+            // ---- Reduce + write output ----
+#if DEEP_EP_INTRANODE_PROF
+            uint64_t reduce_t0 = tops::clock64();
+#endif
+            tops::__ef_bfloat16* out_x = ptr_at_elem(combined_x, hidden_elem_offset(token_idx));
+            float* out_w = combined_topk_weights + token_idx * num_topk;
+
+            static constexpr int kNumChunks = kHidden / DEFAULT_VL_LEN;
+
+            if (num_sources == 0) {
+                // No source: emit bias_0 + bias_1 (FP32 accumulate for bit-exactness with the >=2 path).
+                tcle::set_vl(DEFAULT_VL_LEN);
+                #pragma clang loop unroll(full)
+                for (int ci = 0; ci < kNumChunks; ci++) {
+                    __vector4 float acc = (__vector4 float)(0);
+                    if (bias_0 != nullptr)
+                        acc += tcle::cvt<__vector4 float>(
+                            *reinterpret_cast<const __vector2 __bf16*>(
+                                ptr_at_elem(bias_0, hidden_elem_offset(token_idx) + ci * DEFAULT_VL_LEN)));
+                    if (bias_1 != nullptr)
+                        acc += tcle::cvt<__vector4 float>(
+                            *reinterpret_cast<const __vector2 __bf16*>(
+                                ptr_at_elem(bias_1, hidden_elem_offset(token_idx) + ci * DEFAULT_VL_LEN)));
+                    *reinterpret_cast<__vector2 __bf16*>(out_x + ci * DEFAULT_VL_LEN) =
+                        tcle::cvt<__vector2 __bf16>(acc);
+                }
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    tcle::store((__vector float)(0), out_w);
+                }
+            } else if (num_sources == 1 && bias_0 == nullptr && bias_1 == nullptr) {
+                // Fast path: reuse stage[0] staged in tail_poll, emit via L1->HBM DTE.
+                dte_event.wait();
+                uint8_t* stage = reduce_stage[subthread_id][0];
+                dte.config_memcpy(
+                    tops::mdspan(tops::Global, (uint8_t*)out_x, hidden_bytes),
+                    tops::mdspan(tops::Local,  stage,           hidden_bytes));
+                dte_event = dte.trigger();
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    auto v_w = tcle::load<__vector float>((float*)(stage + hidden_bytes));
+                    tcle::store(v_w, out_w);
+                }
+                dte_event.wait();
+                // Restore recv descriptor (Local<-Global) so next iter's tail_poll only pays set_*_addr.
+                dte.config_memcpy(
+                    tops::mdspan(tops::Local,  stage, transfer_bytes),
+                    tops::mdspan(tops::Global,
+                                 reinterpret_cast<uint8_t*>(esl_channel_data.recv_buffer(0)),
+                                 transfer_bytes));
+            } else if constexpr (kNumChunks >= 16) {
+                // split-reduce: one-pass acc[kNumChunks]*4 regs + load temps > 96 VARAM (PARITY ERR); process in 2 halves.
+                EP_STATIC_ASSERT(kNumChunks % 2 == 0, "B1 split-reduce requires even kNumChunks");
+                static constexpr int kHalfChunks = kNumChunks / 2;
+
+                tcle::set_vl(DEFAULT_VL_LEN);
+                __vector float acc_w = (__vector float)(0);
+
+                #pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    const int ci_base = half * kHalfChunks;
+
+                    tcle::set_vl(DEFAULT_VL_LEN);
+                    __vector4 float acc[kHalfChunks];
+                    #pragma clang loop unroll(full)
+                    for (int ci = 0; ci < kHalfChunks; ci++)
+                        acc[ci] = (__vector4 float)(0);
+
+                    if (bias_0 != nullptr) {
+                        #pragma clang loop unroll(full)
+                        for (int ci = 0; ci < kHalfChunks; ci++)
+                            acc[ci] += tcle::cvt<__vector4 float>(
+                                *reinterpret_cast<const __vector2 __bf16*>(
+                                    ptr_at_elem(bias_0, hidden_elem_offset(token_idx) +
+                                                (ci_base + ci) * DEFAULT_VL_LEN)));
+                    }
+                    if (bias_1 != nullptr) {
+                        #pragma clang loop unroll(full)
+                        for (int ci = 0; ci < kHalfChunks; ci++)
+                            acc[ci] += tcle::cvt<__vector4 float>(
+                                *reinterpret_cast<const __vector2 __bf16*>(
+                                    ptr_at_elem(bias_1, hidden_elem_offset(token_idx) +
+                                                (ci_base + ci) * DEFAULT_VL_LEN)));
+                    }
+
+                    // Pass-1 re-kicks source 0 DTE (tail_poll only primed pass 0).
+                    if (half == 1) {
+                        dte.set_dst_addr(reduce_stage[subthread_id][0]);
+                        dte.set_src_addr(source_ptrs[0]);
+                        dte_event = dte.trigger();
+                    }
+
+                    for (int s = 0; s < num_sources; s++) {
+                        int cur = s & 1;
+                        dte_event.wait();
+
+                        if (s + 1 < num_sources) {
+                            int next = 1 - cur;
+                            dte.set_dst_addr(reduce_stage[subthread_id][next]);
+                            dte.set_src_addr(source_ptrs[s + 1]);
+                            dte_event = dte.trigger();
+                        }
+
+                        const uint8_t* stage_cur = reduce_stage[subthread_id][cur];
+
+                        // topk accumulated only in pass 0 to avoid double-counting.
+                        if (half == 0 && num_topk > 0) {
+                            tcle::set_vl(num_topk);
+                            acc_w += tcle::load<__vector float>(
+                                (float*)(stage_cur + hidden_bytes));
+                        }
+
+                        tcle::set_vl(DEFAULT_VL_LEN);
+                        const auto* src = reinterpret_cast<const tops::__ef_bfloat16*>(stage_cur);
+                        #pragma clang loop unroll(full)
+                        for (int ci = 0; ci < kHalfChunks; ci++)
+                            acc[ci] += tcle::cvt<__vector4 float>(
+                                *reinterpret_cast<const __vector2 __bf16*>(
+                                    src + (ci_base + ci) * DEFAULT_VL_LEN));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int ci = 0; ci < kHalfChunks; ci++)
+                        *reinterpret_cast<__vector2 __bf16*>(out_x + (ci_base + ci) * DEFAULT_VL_LEN) =
+                            tcle::cvt<__vector2 __bf16>(acc[ci]);
+                }
+
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    tcle::store(acc_w, out_w);
+                }
+            } else {
+                // CDTE-assisted multi-source reduce: HBM->L1 double-buffered; accumulation order fixed for bit-exactness.
+                tcle::set_vl(DEFAULT_VL_LEN);
+
+                __vector4 float acc[kNumChunks];
+                #pragma clang loop unroll(full)
+                for (int ci = 0; ci < kNumChunks; ci++)
+                    acc[ci] = (__vector4 float)(0);
+
+                if (bias_0 != nullptr) {
+                    #pragma clang loop unroll(full)
+                    for (int ci = 0; ci < kNumChunks; ci++)
+                        acc[ci] += tcle::cvt<__vector4 float>(
+                            *reinterpret_cast<const __vector2 __bf16*>(
+                                ptr_at_elem(bias_0, hidden_elem_offset(token_idx) + ci * DEFAULT_VL_LEN)));
+                }
+                if (bias_1 != nullptr) {
+                    #pragma clang loop unroll(full)
+                    for (int ci = 0; ci < kNumChunks; ci++)
+                        acc[ci] += tcle::cvt<__vector4 float>(
+                            *reinterpret_cast<const __vector2 __bf16*>(
+                                ptr_at_elem(bias_1, hidden_elem_offset(token_idx) + ci * DEFAULT_VL_LEN)));
+                }
+
+                tcle::set_vl(DEFAULT_VL_LEN);
+                __vector float acc_w = (__vector float)(0);
+
+                for (int s = 0; s < num_sources; s++) {
+                    int cur = s & 1;
+                    dte_event.wait();
+
+                    if (s + 1 < num_sources) {
+                        int next = 1 - cur;
+                        dte.set_dst_addr(reduce_stage[subthread_id][next]);
+                        dte.set_src_addr(source_ptrs[s + 1]);
+                        dte_event = dte.trigger();
+                    }
+
+                    const uint8_t* stage_cur = reduce_stage[subthread_id][cur];
+
+                    if (num_topk > 0) {
+                        tcle::set_vl(num_topk);
+                        acc_w += tcle::load<__vector float>(
+                            (float*)(stage_cur + hidden_bytes));
+                    }
+
+                    tcle::set_vl(DEFAULT_VL_LEN);
+                    const auto* src = reinterpret_cast<const tops::__ef_bfloat16*>(stage_cur);
+                    #pragma clang loop unroll(full)
+                    for (int ci = 0; ci < kNumChunks; ci++)
+                        acc[ci] += tcle::cvt<__vector4 float>(
+                            *reinterpret_cast<const __vector2 __bf16*>(src + ci * DEFAULT_VL_LEN));
+                }
+
+                tcle::set_vl(DEFAULT_VL_LEN);
+                #pragma clang loop unroll(full)
+                for (int ci = 0; ci < kNumChunks; ci++)
+                    *reinterpret_cast<__vector2 __bf16*>(out_x + ci * DEFAULT_VL_LEN) =
+                        tcle::cvt<__vector2 __bf16>(acc[ci]);
+
+                if (num_topk > 0) {
+                    tcle::set_vl(num_topk);
+                    tcle::store(acc_w, out_w);
+                }
+            }
+
+#if DEEP_EP_INTRANODE_PROF
+            prof_reduce_cycles += tops::clock64() - reduce_t0;
+#endif
+
+            for (int s = 0; s < num_sources; s++) {
+                int ri = source_ri[s];
+                cache_head[ri][subthread_id] = pending_head[s];
+                last_written_head[ri] = pending_head[s];
+            }
+
+            recv_processed++;
+            if ((recv_processed & (kRecvHeadSendStep - 1)) == 0) {
+#if DEEP_EP_INTRANODE_PROF
+                uint64_t hu_t0 = tops::clock64();
+#endif
+                do_head_update();
+#if DEEP_EP_INTRANODE_PROF
+                prof_head_update_cycles += tops::clock64() - hu_t0;
+                prof_num_head_updates++;
+#endif
+            }
+        }
+
+        // Soft barrier: spin while still calling do_head_update so peer senders don't stall on this sub's responsible_rank.
+        post_loop_arrived[subthread_id] = 1;
+
+        uint64_t pl_start = tops::clock64();
+        bool pl_timed_out_printed = false;
+        uint32_t pl_spins = 0;
+        while (true) {
+            int all_arrived = 1;
+            for (int s = 0; s < num_subthreads; s++) {
+                if (post_loop_arrived[s] == 0) { all_arrived = 0; break; }
+            }
+            if (all_arrived) break;
+            do_head_update();
+            pl_spins++;
+            if (!pl_timed_out_printed &&
+                (pl_spins & (kTimeoutCheckInterval - 1)) == 0 &&
+                tops::clock64() - pl_start > kCombineTimeoutCycles) {
+                printf("[combine][timeup][PostLoop soft-barrier] rank=%d ch=%d sub=%d arrived={%d,%d,%d,%d,%d,%d,%d,%d}\n",
+                       rank, channel_id, subthread_id,
+                       (int)post_loop_arrived[0], (int)post_loop_arrived[1],
+                       (int)post_loop_arrived[2], (int)post_loop_arrived[3],
+                       (int)post_loop_arrived[4], (int)post_loop_arrived[5],
+                       (int)post_loop_arrived[6], (int)post_loop_arrived[7]);
+                pl_timed_out_printed = true;
+            }
+        }
+
+        do_head_update();
+    }
+
+#if DEEP_EP_INTRANODE_PROF
+    uint64_t prof_total = tops::clock64() - prof_start;
+
+    if (rank == 0 && channel_id == 0) {
+        if (is_sender) {
+            if (subthread_id == 0 || subthread_id == 1) {
+                printf("[PROF][S] rank=%d ch=%d sub=%d total=%lu dte_wait=%lu esl_send=%lu flow_ctrl=%lu "
+                       "tokens=%d flushes=%d\n",
+                       rank, channel_id, subthread_id, prof_total,
+                       prof_dte_wait_cycles, prof_esl_send_cycles, prof_flow_ctrl_cycles,
+                       prof_num_tokens_sent, prof_num_esl_flushes);
+            }
+        } else if (subthread_id == 0) {
+            printf("[PROF][R] rank=%d ch=%d sub=%d total=%lu tail_poll=%lu reduce=%lu head_upd=%lu "
+                   "head_cnt=%d tail_spins=%d\n",
+                   rank, channel_id, subthread_id, prof_total,
+                   prof_tail_poll_cycles, prof_reduce_cycles, prof_head_update_cycles,
+                   prof_num_head_updates, prof_num_tail_spins);
+        }
+    }
+#endif
+
+    // ===================================================================
+    //  BARRIER + BUFFER CLEAN  (SymBuffer-based, ESL-mapped)
+    // ===================================================================
+    tops::sync_grid_threads();
+
+    if (sm_id == 0) {
+        volatile int* src_flag = (volatile int*)esl_barrier.send_buffer(rank);
+        *src_flag = kSpecialFlag;
+        tcle::fence<tcle::L3_MEM_STORE>();
+
+        if (subthread_id < kNumRanks && subthread_id != rank) {
+            uint8_t* remote_flag = (uint8_t*)esl_barrier.recv_buffer(rank) +
+                                    buffer_offset[subthread_id];
+            uint64_t bar_wqe = esl_gda.get_wqe_slots_raw(&esl_qp, 1);
+            esl_gda.send<NON_ATOMIC_OPERATION, uint8_t>(
+                remote_flag, (uint8_t*)src_flag, &esl_qp, bar_wqe,
+                sizeof(int), true);
+            __gcu_get_spr_barrier(BARRIER_MASK_L3);
+            esl_gda.ringDb_raw(&esl_qp, bar_wqe, 1);
+        }
+        __syncsubthreads();
+
+        if (subthread_id < kNumRanks && subthread_id != rank) {
+            volatile int* my_flag = (volatile int*)esl_barrier.recv_buffer(subthread_id);
+            uint64_t bar_start = tops::clock64();
+            bool barrier_timed_out_printed = false;
+            while (true) {
+                int got = *my_flag;
+                if (got == kSpecialFlag) break;
+                if (!barrier_timed_out_printed &&
+                    tops::clock64() - bar_start > kCombineTimeoutCycles) {
+                    volatile struct qp_shared_state* qs_dbg =
+                        (volatile struct qp_shared_state*) esl_qp.qp_shared_state_ptr;
+                    // Snapshot all my recv flags from every other peer to see who arrived.
+                    int f0 = -1, f1 = -1, f2 = -1, f3 = -1, f4 = -1, f5 = -1, f6 = -1, f7 = -1;
+                    {
+                        volatile int* fp;
+                        if (kNumRanks > 0) { fp = (volatile int*)esl_barrier.recv_buffer(0); f0 = *fp; }
+                        if (kNumRanks > 1) { fp = (volatile int*)esl_barrier.recv_buffer(1); f1 = *fp; }
+                        if (kNumRanks > 2) { fp = (volatile int*)esl_barrier.recv_buffer(2); f2 = *fp; }
+                        if (kNumRanks > 3) { fp = (volatile int*)esl_barrier.recv_buffer(3); f3 = *fp; }
+                        if (kNumRanks > 4) { fp = (volatile int*)esl_barrier.recv_buffer(4); f4 = *fp; }
+                        if (kNumRanks > 5) { fp = (volatile int*)esl_barrier.recv_buffer(5); f5 = *fp; }
+                        if (kNumRanks > 6) { fp = (volatile int*)esl_barrier.recv_buffer(6); f6 = *fp; }
+                        if (kNumRanks > 7) { fp = (volatile int*)esl_barrier.recv_buffer(7); f7 = *fp; }
+                    }
+                    printf("[combine][timeup][barrier] rank=%d waiting on slot %d got=%d expected=%d "
+                           "post=%lu done=%lu flags={%d,%d,%d,%d,%d,%d,%d,%d}\n",
+                           rank, subthread_id, got, kSpecialFlag,
+                           qs_dbg->postIdx, qs_dbg->doneIdx,
+                           f0, f1, f2, f3, f4, f5, f6, f7);
+                    barrier_timed_out_printed = true;
+                }
+            }
+        }
+        __syncsubthreads();
+    }
+
+    tops::sync_grid_threads();
+
+    {
+        // Clear only per-slot tail markers; control region is cleared by cached_notify_combine.
+        const int worker_num = num_sms * num_subthreads;
+        const int worker_id = sm_id * num_subthreads + subthread_id;
+        int total_slots = num_recv_buffer_tokens * kNumRanks * num_channels * 2;
+        uint8_t* data_region = buffer_base + esl_ctrl_bytes;
+        for (int s = worker_id; s < total_slots; s += worker_num) {
+            *(volatile int*)(data_region + s * num_bytes_per_token + data_bytes) = 0;
+        }
+        tcle::fence<tcle::L3_MEM_STORE>();
+        __gcu_get_spr_barrier(BARRIER_MASK_L3);
+    }
+
+    tops::sync_grid_threads();
+}
+
+void combine(int type,
+             void* recv_x, float* recv_topk_weights,
+             const void* x, const float* topk_weights,
+             const void* bias_0, const void* bias_1,
+             const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
+             int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
+             void** buffer_ptrs, int rank, int num_ranks,
+             topsStream_t stream, int num_sms,
+             int num_max_send_tokens, int num_recv_buffer_tokens, struct primitives* prims, int* cached_value_ptrs) {
+    static_cast<void>(type);
+    // Combine uses 2x SIPs vs dispatch: sender + receiver per channel
+    auto [num_blocks, num_threads, num_subthreads_per_thread] = CALCULATE_COMBINE_LAUNCH_CONFIG_BY_SMS(num_sms, num_ranks);
+    int actual_sips = num_blocks * num_threads;
+    EP_HOST_ASSERT(actual_sips % 2 == 0 && "Ring-buffer combine requires even SIP count (sender/receiver pairs)");
+
+#define COMBINE_LAUNCH_HIDDEN(hidden_val) { \
+    auto kernel = combine<_combine_ranks, hidden_val>; \
+    LAUNCH_KERNEL(&cfg, kernel, \
+        reinterpret_cast<tops::__ef_bfloat16*>(recv_x), recv_topk_weights, \
+        reinterpret_cast<const tops::__ef_bfloat16*>(x), topk_weights,   \
+        reinterpret_cast<const tops::__ef_bfloat16*>(bias_0), reinterpret_cast<const tops::__ef_bfloat16*>(bias_1), \
+        src_idx, rank_prefix_matrix, channel_prefix_matrix, \
+        send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
+        buffer_ptrs, rank, \
+        num_max_send_tokens, num_recv_buffer_tokens, prims, cached_value_ptrs); } \
+    break
+#define COMBINE_LAUNCH_CASE(ranks) \
+    { constexpr int _combine_ranks = ranks; \
+      SWITCH_HIDDEN(COMBINE_LAUNCH_HIDDEN); } break
+    SETUP_LAUNCH_CONFIG(num_blocks, num_threads, num_subthreads_per_thread, stream);
+    SWITCH_RANKS(COMBINE_LAUNCH_CASE);
+#undef COMBINE_LAUNCH_HIDDEN
+#undef COMBINE_LAUNCH_CASE
+}
+
+} // namespace intranode
+
+} // namespace deep_ep

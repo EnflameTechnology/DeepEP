@@ -1,0 +1,32 @@
+// Copyright 2025 Enflame. All Rights Reserved.
+
+#include "kernels/configs.h"
+#include "kernels/exception.h"
+#include "kernels/launch.h"
+
+namespace deep_ep {
+
+namespace delay {
+
+__global__ void delay_kernel(unsigned int delay_ns) {
+    const auto subthread_id = static_cast<int>(subThreadIdx.x);
+    if (subthread_id == 0) {
+        constexpr unsigned int MAX_STEP_NS = 1000000;  // 1ms per step
+        unsigned int remaining = delay_ns;
+        while (remaining > 0) {
+            unsigned int step =
+                (remaining > MAX_STEP_NS) ? MAX_STEP_NS : remaining;
+            tops::__nanosleep(step);
+            remaining -= step;
+        }
+    }
+}
+
+void launch_delay(unsigned int delay_ns, topsStream_t stream) {
+    SETUP_LAUNCH_CONFIG(1, 1, 1, stream);
+    LAUNCH_KERNEL(&cfg, delay_kernel, delay_ns);
+}
+
+}  // namespace delay
+
+}  // namespace deep_ep
