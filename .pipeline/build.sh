@@ -7,7 +7,7 @@ SCRIPT_DIR=$(dirname $(realpath $0))
 project_dir=${SCRIPT_DIR}/..
 BUILD_ROOT_DIR=$(pwd)
 ARCH=$(uname -m)
-
+echo $BUILD_ROOT_DIR
 # run in docker container
 # registry-egc.enflame-tech.com/artifacts/deepep:torch2.11.0-TR3.8.106-ubuntu2204
 
